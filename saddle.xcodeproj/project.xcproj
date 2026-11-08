@@ -36,7 +36,9 @@
           ],
         },
       ],
-    }, {
+    },
+    { "kind": "folder", "path": "saddleTests", "target-membership": [ "saddleTests" ] },
+    {
       "kind": "group",
       "name": "Frameworks",
       "children": [
@@ -48,6 +50,7 @@
       "children": [
         { "path": "<PRODUCTS>/saddle.app", "id": "000000000000000000000120", "type": "wrapper.application", "index": false },
         { "path": "<PRODUCTS>/SaddleFileProvider.appex", "id": "6A6E0BA030A121BB0031C0D8", "type": "wrapper.app-extension", "index": false, "target-membership": [ { "build-phase": "saddle/copy/Embed Foundation Extensions", "header-preservation": "remove-on-copy" } ] },
+        { "path": "<PRODUCTS>/saddleTests.xctest", "id": "B7E4A1C92F0D4E6A8C1B3D5F", "type": "wrapper.cfbundle", "index": false },
       ],
     },
   ],
@@ -148,7 +151,7 @@
           "@executable_path/../../../../Frameworks",
         ],
         "MARKETING_VERSION": "0.1.0",
-        "PRODUCT_BUNDLE_IDENTIFIER": "devplaceholder.D0V8Z825.saddle.SaddleFileProvider",
+        "PRODUCT_BUNDLE_IDENTIFIER": "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).saddle.SaddleFileProvider",
         "PRODUCT_NAME": "$(TARGET_NAME)",
         "SDKROOT": "macosx",
         "SKIP_INSTALL": "YES",
@@ -157,6 +160,36 @@
         "SWIFT_EMIT_LOC_STRINGS": "YES",
         "SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY": "YES",
         "SWIFT_VERSION": "5.0",
+      },
+    }, {
+      "name": "saddleTests",
+      "id": "C8F5B2DA301E5F7B9D2C4E60",
+      "product": "Products/saddleTests.xctest",
+      "product-type": "bundle.unit-test",
+      "test-host-target": "saddle",
+      "dependencies": [
+        "saddle",
+      ],
+      "build-phases": [
+        "compile-sources",
+        "frameworks",
+        "resources",
+      ],
+      "build-settings": {
+        "BUNDLE_LOADER": "$(TEST_HOST)",
+        "CODE_SIGN_STYLE": "Automatic",
+        "GENERATE_INFOPLIST_FILE": "YES",
+        "LD_RUNPATH_SEARCH_PATHS": [
+          "$(inherited)",
+          "@executable_path/../Frameworks",
+          "@loader_path/../Frameworks",
+        ],
+        "MACOSX_DEPLOYMENT_TARGET": "27.2",
+        "PRODUCT_BUNDLE_IDENTIFIER": "devplaceholder.$(PROJECT_UNIQUE_VALUE:identifier).saddleTests",
+        "PRODUCT_NAME": "$(TARGET_NAME)",
+        "SDKROOT": "macosx",
+        "SWIFT_VERSION": "5.0",
+        "TEST_HOST": "$(BUILT_PRODUCTS_DIR)/saddle.app/Contents/MacOS/saddle",
       },
     },
   ],

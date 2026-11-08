@@ -26,7 +26,9 @@ nonisolated enum SecretStore {
 
     /// The shared data protection keychain needs a team-signed build. Without one, fall
     /// back to the process's own login keychain items (not visible to the extension).
-    private static let useSharedKeychain: Bool = {
+    /// False when this process isn't allowed to use the shared data-protection keychain.
+    /// Secrets then stay in the login keychain, which the file provider extension cannot read.
+    static let sharesWithExtension: Bool = {
         let probe: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -43,7 +45,7 @@ nonisolated enum SecretStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: "\(profileID.uuidString).\(kind.rawValue)",
         ]
-        if useSharedKeychain {
+        if sharesWithExtension {
             query[kSecAttrAccessGroup as String] = AppGroup.identifier
             query[kSecUseDataProtectionKeychain as String] = true
         }

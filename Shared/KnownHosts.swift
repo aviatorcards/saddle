@@ -10,7 +10,6 @@ import Synchronization
 /// extension only accepts keys that are already trusted, because it can't show UI.
 nonisolated enum KnownHosts {
     private static var url: URL { AppGroup.containerURL.appending(path: "known_hosts.json") }
-    private static let lock = Mutex(())
 
     enum Verdict: Equatable, Sendable {
         case trusted
@@ -23,7 +22,7 @@ nonisolated enum KnownHosts {
     }
 
     static func verdict(host: String, port: Int, presentedKey: String) -> Verdict {
-        let stored = lock.withLock { _ in JSONFile.read([String: String].self, from: url) ?? [:] }
+        let stored = readStore()
         guard let existing = stored[key(host: host, port: port)] else { return .unknown }
         return normalized(existing) == normalized(presentedKey)
             ? .trusted
@@ -31,18 +30,29 @@ nonisolated enum KnownHosts {
     }
 
     static func trust(host: String, port: Int, openSSHKey: String) throws {
-        try lock.withLock { _ in
-            var stored = JSONFile.read([String: String].self, from: url) ?? [:]
+        try mutateStore { stored in
             stored[key(host: host, port: port)] = normalized(openSSHKey)
-            try JSONFile.write(stored, to: url)
         }
     }
 
     static func forget(host: String, port: Int) {
-        lock.withLock { _ in
-            var stored = JSONFile.read([String: String].self, from: url) ?? [:]
+        try? mutateStore { stored in
             stored[key(host: host, port: port)] = nil
-            try? JSONFile.write(stored, to: url)
+        }
+    }
+
+    /// The app and the extension are different processes. The in-memory mutex is not enough.
+    private static func readStore() -> [String: String] {
+        (try? FileLock.withLock(url: url) {
+            JSONFile.read([String: String].self, from: url) ?? [:]
+        }) ?? (JSONFile.read([String: String].self, from: url) ?? [:])
+    }
+
+    private static func mutateStore(_ body: (inout [String: String]) -> Void) throws {
+        try FileLock.withLock(url: url) {
+            var stored = JSONFile.read([String: String].self, from: url) ?? [:]
+            body(&stored)
+            try JSONFile.write(stored, to: url)
         }
     }
 
