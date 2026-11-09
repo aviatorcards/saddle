@@ -325,12 +325,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             let context = try await context()
             let path = try await relativePath(for: itemIdentifier, in: context)
             let remotePath = try absolute(path, in: context)
-            let described = try await metadata(for: path, in: context)
-            if described.isSymlink {
-                throw NSFileProviderError(.cannotSynchronize, userInfo: [
-                    NSLocalizedDescriptionKey: "Saddle doesn't open symbolic links. Following one could read outside the mounted folder.",
-                ])
-            }
+            // Throws for a link that no longer resolves inside the mount.
+            _ = try await metadata(for: path, in: context)
             guard let manager = NSFileProviderManager(for: domain) else { throw NSFileProviderError(.providerNotFound) }
             let destination = try manager.temporaryDirectoryURL().appending(path: UUID().uuidString)
 
@@ -398,13 +394,18 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             if options.contains(.mayAlreadyExist) {
                 let existingPath = try Self.childPath(parent, itemTemplate.filename)
                 if let existing = try await existingItem(at: existingPath, in: context), existing.isDirectory == isFolder {
-                    let localSize = url.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.map(Int64.init)
-                    let sameSize = localSize == Int64(exactly: existing.size)
-                    if isFolder || url == nil || sameSize {
-                        // A replay of our own create. Refetch when we didn't just upload these bytes
-                        // so Finder doesn't keep a different local copy under the server's version.
+                    // Adopt the server item only when it is provably the same: a folder, or a file
+                    // with identical bytes. Anything else falls through and is uploaded beside it,
+                    // so a local edit is never replaced by the server copy.
+                    let sameBytes: Bool
+                    if let url, !isFolder {
+                        sameBytes = try await remoteFile(existingPath, matches: url, size: existing.size, in: context)
+                    } else {
+                        sameBytes = true
+                    }
+                    if sameBytes {
                         let item = await makeItem(existing, relativePath: existingPath, in: context)
-                        return AppliedItem(item: item, fetchContent: url != nil && !isFolder)
+                        return AppliedItem(item: item, fetchContent: url == nil && !isFolder)
                     }
                 }
             }
@@ -416,7 +417,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     try await context.session.createDirectory(remotePath)
                 } else {
                     try await upload(url, to: remotePath, name: RemotePath.name(of: path), progress: progress, context: context)
-                    if fields.contains(.contentModificationDate), let date = itemTemplate.contentModificationDate {
+                    if fields.contains(.contentModificationDate), let date = itemTemplate.contentModificationDate ?? nil {
                         try? await context.session.setModificationDate(date, for: remotePath)
                     }
                     if itemTemplate.fileSystemFlags?.contains(.userExecutable) == true {
@@ -474,10 +475,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             }
             let remotePath = try absolute(path, in: context)
 
+            // Uploads replace the destination file, so writing to the link's own path would
+            // turn the link into a regular file. Write to the target it resolves to instead.
+            var contentPath = remotePath
             if current.isSymlink, changedFields.contains(.contents) {
-                throw NSFileProviderError(.cannotSynchronize, userInfo: [
-                    NSLocalizedDescriptionKey: "Saddle doesn't write through symbolic links.",
-                ])
+                guard let link = try await context.session.resolveLink(remotePath) else {
+                    throw NSFileProviderError(.noSuchItem)
+                }
+                contentPath = link.target
             }
             if changedFields.contains(.contents), !current.isDirectory {
                 guard newContents != nil else {
@@ -496,12 +501,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     try await uploadConflictCopy(newContents, of: path, progress: progress, context: context)
                     fetchContent = true
                 } else {
-                    try await upload(newContents, to: remotePath, name: item.filename, progress: progress, context: context)
-                    if let date = item.contentModificationDate {
-                        try? await context.session.setModificationDate(date, for: remotePath)
+                    try await upload(newContents, to: contentPath, name: item.filename, progress: progress, context: context)
+                    if let date = item.contentModificationDate ?? nil {
+                        try? await context.session.setModificationDate(date, for: contentPath)
                     }
                 }
-            } else if changedFields.contains(.contentModificationDate), let date = item.contentModificationDate {
+            } else if changedFields.contains(.contentModificationDate), let date = item.contentModificationDate ?? nil {
                 try? await context.session.setModificationDate(date, for: remotePath)
             }
 
@@ -546,6 +551,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             let remotePath = try absolute(path, in: context)
             let parentID = await context.state.identifier(for: Self.parent(of: path))
 
+            if await context.state.isSymlink(path) {
+                // Unlink only. Never resolve the link, so its target is never touched.
+                try await context.session.removeFile(remotePath)
+                await context.status.log("Deleted \(RemotePath.name(of: path))")
+                let removed = await context.state.remove(path)
+                await context.state.noteDeletions(removed)
+                await context.state.updateChild(identifier, version: nil, in: parentID)
+                await context.state.flush()
+                return
+            }
+
             let entry: RemoteEntry?
             do {
                 entry = try await metadata(for: path, in: context)
@@ -558,7 +574,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             }
 
             if let entry {
-                if !entry.isSymlink, !entry.isDirectory, !Self.contentMatches(entry, version) {
+                if !entry.isDirectory, !Self.contentMatches(entry, version) {
                     throw NSFileProviderError(.deletionRejected, userInfo: [
                         NSLocalizedDescriptionKey: "The file changed on the server, so it was not deleted.",
                     ])
@@ -601,15 +617,44 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     // MARK: - Uploads
 
-    /// Metadata for an item. Symlinks recorded while listing are not followed, so a link to a
-    /// directory is not treated as that directory (which would let a delete walk out of the mount).
+    /// Metadata for an item. Links recorded while listing are re-resolved, and rejected if they
+    /// now point outside the mount, so their versions match what the listing reported.
     private func metadata(for relativePath: String, in context: Context) async throws -> RemoteEntry {
         let remote = try absolute(relativePath, in: context)
         if !relativePath.isEmpty, await context.state.isSymlink(relativePath) {
-            return RemoteEntry(path: remote, name: RemotePath.name(of: relativePath), kind: .file,
-                               size: 0, modified: .distantPast, permissions: 0o777, isSymlink: true)
+            guard let link = try await context.session.resolveLink(remote) else {
+                throw NSFileProviderError(.noSuchItem)
+            }
+            return link.entry
         }
         return try await context.session.stat(remote)
+    }
+
+    /// Byte-for-byte comparison of a remote file with a local one. Only downloads when the
+    /// sizes already match, which is the only case where they can be equal.
+    private func remoteFile(_ relativePath: String, matches localURL: URL, size: UInt64, in context: Context) async throws -> Bool {
+        let localSize = (try? localURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(UInt64.init(exactly:))
+        guard localSize == size else { return false }
+        guard let manager = NSFileProviderManager(for: domain) else { throw NSFileProviderError(.providerNotFound) }
+        let copy = try manager.temporaryDirectoryURL().appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: copy) }
+        try await context.session.download(try absolute(relativePath, in: context), to: copy) { _ in }
+        return try Self.filesHaveSameBytes(copy, localURL)
+    }
+
+    static func filesHaveSameBytes(_ first: URL, _ second: URL) throws -> Bool {
+        let a = try FileHandle(forReadingFrom: first)
+        let b = try FileHandle(forReadingFrom: second)
+        defer {
+            try? a.close()
+            try? b.close()
+        }
+        while true {
+            let chunkA = try a.read(upToCount: 1 << 20) ?? Data()
+            let chunkB = try b.read(upToCount: 1 << 20) ?? Data()
+            if chunkA != chunkB { return false }
+            if chunkA.isEmpty { return true }
+        }
     }
 
     private func existingItem(at relativePath: String, in context: Context) async throws -> RemoteEntry? {

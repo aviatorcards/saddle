@@ -29,6 +29,26 @@ final class RemotePathTests: XCTestCase {
         XCTAssertFalse(RemotePath.isPartialUpload(".saddle-abc.bak"))
         XCTAssertFalse(RemotePath.isPartialUpload("notes.txt"))
     }
+
+    func testBackupNamesRecordTheOriginal() {
+        let backup = RemotePath.backupName(for: "report.final.pdf")
+        XCTAssertTrue(backup.hasPrefix(".saddle-"))
+        XCTAssertTrue(backup.hasSuffix(".bak"))
+        XCTAssertEqual(RemotePath.originalName(ofBackup: backup), "report.final.pdf")
+        // Too long to embed the original: falls back to an anonymous backup, which stays visible.
+        let long = RemotePath.backupName(for: String(repeating: "a", count: 250))
+        XCTAssertNil(RemotePath.originalName(ofBackup: long))
+        XCTAssertNil(RemotePath.originalName(ofBackup: ".saddle-abc.part"))
+        XCTAssertNil(RemotePath.originalName(ofBackup: "notes.bak"))
+    }
+
+    func testIsInsideRequiresAComponentBoundary() {
+        XCTAssertTrue(RemotePath.isInside("/home/me", root: "/home/me"))
+        XCTAssertTrue(RemotePath.isInside("/home/me/www", root: "/home/me"))
+        XCTAssertFalse(RemotePath.isInside("/home/meadow", root: "/home/me"))
+        XCTAssertFalse(RemotePath.isInside("/var/www", root: "/home/me"))
+        XCTAssertTrue(RemotePath.isInside("/var/www", root: "/"))
+    }
 }
 
 final class IdentifierMapTests: XCTestCase {
@@ -47,7 +67,7 @@ final class IdentifierMapTests: XCTestCase {
 }
 
 final class SSHConfigImporterTests: XCTestCase {
-    func testFirstValueWinsAndWildcardsAreNotImported() {
+    func testFirstValueWinsAndWildcardsAreNotImported() throws {
         let text = """
         User alice
         Host web *.example.com other
@@ -100,7 +120,7 @@ final class SSHConfigImporterTests: XCTestCase {
     func testContinuationLinesAndCommaSeparatedHosts() {
         let text = """
         Host one,two
-            HostName \
+            HostName \\
             shared.example.com
         """
         let profiles = SSHConfigImporter.profiles(fromConfig: text)
