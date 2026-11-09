@@ -243,13 +243,15 @@ final class AppModel {
     private func confirmTrust(host: String, fingerprint: String, previousFingerprint: String?) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async {
-                continuation.resume(returning: Self.presentTrustAlert(host: host, fingerprint: fingerprint, previousFingerprint: previousFingerprint))
+                let trusted = MainActor.assumeIsolated {
+                    Self.presentTrustAlert(host: host, fingerprint: fingerprint, previousFingerprint: previousFingerprint)
+                }
+                continuation.resume(returning: trusted)
             }
         }
     }
 
-    private nonisolated static func presentTrustAlert(host: String, fingerprint: String, previousFingerprint: String?) -> Bool {
-        NSApp.activate()
+    private static func presentTrustAlert(host: String, fingerprint: String, previousFingerprint: String?) -> Bool {
         let alert = NSAlert()
         if let previousFingerprint {
             alert.alertStyle = .critical
@@ -264,6 +266,7 @@ final class AppModel {
                 """
             alert.addButton(withTitle: "Cancel")
             alert.addButton(withTitle: "Replace Key and Connect").hasDestructiveAction = true
+            WindowActivation.prepare(alert)
             return alert.runModal() == .alertSecondButtonReturn
         } else {
             alert.messageText = "Trust \(host)?"
@@ -274,15 +277,16 @@ final class AppModel {
                 """
             alert.addButton(withTitle: "Trust and Connect")
             alert.addButton(withTitle: "Cancel")
+            WindowActivation.prepare(alert)
             return alert.runModal() == .alertFirstButtonReturn
         }
     }
 
     func showAlert(title: String, message: String) {
-        NSApp.activate()
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
+        WindowActivation.prepare(alert)
         alert.runModal()
     }
 

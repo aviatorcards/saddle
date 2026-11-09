@@ -67,7 +67,7 @@ struct MenuContentView: View {
 
     private func showConnections() {
         openWindow(id: ConnectionsView.windowID)
-        NSApp.activate()
+        WindowActivation.bringToFront(windowTitled: "Connections")
     }
 }
 
