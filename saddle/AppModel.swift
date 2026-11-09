@@ -146,11 +146,11 @@ final class AppModel {
         do {
             return try await session.connect()
         } catch SaddleError.unknownHostKey(let host, let port, let fingerprint, let key) {
-            guard confirmTrust(host: host, fingerprint: fingerprint, previousFingerprint: nil) else { throw CancellationError() }
+            guard await confirmTrust(host: host, fingerprint: fingerprint, previousFingerprint: nil) else { throw CancellationError() }
             try KnownHosts.trust(host: host, port: port, openSSHKey: key)
             return try await verify(profile)
         } catch SaddleError.hostKeyChanged(let host, let port, let fingerprint, let previous, let key) {
-            guard confirmTrust(host: host, fingerprint: fingerprint, previousFingerprint: previous) else { throw CancellationError() }
+            guard await confirmTrust(host: host, fingerprint: fingerprint, previousFingerprint: previous) else { throw CancellationError() }
             try KnownHosts.trust(host: host, port: port, openSSHKey: key)
             return try await verify(profile)
         }
@@ -238,7 +238,16 @@ final class AppModel {
 
     // MARK: - User interaction
 
-    private func confirmTrust(host: String, fingerprint: String, previousFingerprint: String?) -> Bool {
+    /// Presents the alert on the main queue without holding the main actor across `runModal`.
+    private func confirmTrust(host: String, fingerprint: String, previousFingerprint: String?) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume(returning: Self.presentTrustAlert(host: host, fingerprint: fingerprint, previousFingerprint: previousFingerprint))
+            }
+        }
+    }
+
+    private nonisolated static func presentTrustAlert(host: String, fingerprint: String, previousFingerprint: String?) -> Bool {
         NSApp.activate()
         let alert = NSAlert()
         if let previousFingerprint {

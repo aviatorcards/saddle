@@ -16,12 +16,28 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var capabilities: NSFileProviderItemCapabilities {
-        var capabilities: NSFileProviderItemCapabilities = [.allowsReading, .allowsWriting, .allowsDeleting]
+        if entry.isSymlink {
+            // The link itself can be renamed or removed. It is not a directory, and writing
+            // would follow it onto whatever the server points at.
+            var capabilities: NSFileProviderItemCapabilities = [.allowsReading, .allowsDeleting]
+            if itemIdentifier != .rootContainer {
+                capabilities.formUnion([.allowsRenaming, .allowsReparenting])
+            }
+            return capabilities
+        }
+        // Unlink depends on the parent directory, so deletion stays available and the server
+        // can still reject it. Content writes follow the remote mode (missing mode defaults to 0644).
+        let writable = entry.permissions & 0o222 != 0
+        var capabilities: NSFileProviderItemCapabilities = [.allowsReading, .allowsDeleting]
+        if writable, !entry.isDirectory {
+            capabilities.insert(.allowsWriting)
+        }
         if itemIdentifier != .rootContainer {
             capabilities.formUnion([.allowsRenaming, .allowsReparenting])
         }
         if entry.isDirectory {
-            capabilities.formUnion([.allowsContentEnumerating, .allowsAddingSubItems])
+            capabilities.formUnion([.allowsContentEnumerating])
+            if writable { capabilities.formUnion([.allowsAddingSubItems, .allowsWriting]) }
         }
         return capabilities
     }
@@ -32,6 +48,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     }
 
     var contentType: UTType {
+        if entry.isSymlink { return .symbolicLink }
         if entry.isDirectory { return .folder }
         return UTType(filenameExtension: (filename as NSString).pathExtension) ?? .data
     }

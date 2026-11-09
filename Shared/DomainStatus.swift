@@ -59,25 +59,32 @@ nonisolated enum ActivityLog {
         guard var line = try? encoder.encode(entry) else { return }
         line.append(0x0A)
 
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
+        try? FileLock.withLock(url: url) {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            guard let handle = try? FileHandle(forWritingTo: url) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
         }
-        guard let handle = try? FileHandle(forWritingTo: url) else { return }
-        defer { try? handle.close() }
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: line)
     }
 
     /// Most recent entries first. Also trims the file when it grows too large.
     static func recent(limit: Int = 50) -> [Entry] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
+        let data = (try? FileLock.withLock(url: url) { () -> Data? in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            let lines = data.split(separator: 0x0A)
+            if lines.count > maxEntries * 2 {
+                let kept = lines.suffix(maxEntries).joined(separator: [0x0A]) + [0x0A]
+                try? Data(kept).write(to: url, options: .atomic)
+            }
+            return data
+        }) ?? nil
+        guard let data else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let lines = data.split(separator: 0x0A)
-        if lines.count > maxEntries * 2 {
-            let kept = lines.suffix(maxEntries).joined(separator: [0x0A]) + [0x0A]
-            try? Data(kept).write(to: url, options: .atomic)
-        }
         return lines.suffix(limit).reversed().compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
     }
 }

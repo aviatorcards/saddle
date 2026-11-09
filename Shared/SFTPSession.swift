@@ -16,12 +16,13 @@ nonisolated struct RemoteEntry: Sendable, Hashable {
     var size: UInt64
     var modified: Date
     var permissions: UInt32
-    /// True when the entry was reached through a symbolic link (attributes are the target's).
+    /// True when the entry was reached through a symbolic link (attributes are the link's, not the target's).
     var isSymlink = false
 
-    var isDirectory: Bool { kind == .directory }
+    var isDirectory: Bool { kind == .directory && !isSymlink }
 
     /// Changes whenever the content changes. Size + mtime is all SFTP v3 gives us.
+    /// Mtime is whole seconds, so two edits in the same second with the same size compare equal.
     var contentVersion: String { "\(size):\(Int64(modified.timeIntervalSince1970))" }
     var metadataVersion: String { "\(contentVersion):\(permissions & 0o7777)" }
 }
@@ -43,18 +44,59 @@ nonisolated enum RemotePath {
     static func name(of path: String) -> String {
         path.split(separator: "/").last.map(String.init) ?? path
     }
+
+    /// A single path component Finder or the server is allowed to introduce.
+    static func isSafeComponent(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".."
+            && !name.contains("/") && !name.contains("\0")
+    }
+
+    /// Lexically join `relative` onto `root` and reject `..` that would leave `root`.
+    ///
+    /// This does not defeat a symlink the server resolves itself. It does stop a
+    /// listing name or a stored path of `../` from being concatenated out of the mount.
+    static func resolved(_ relative: String, under root: String) -> String? {
+        let rootParts = parts(of: root)
+        var combined = rootParts
+        for component in parts(of: relative) {
+            if component == "." { continue }
+            if component.contains("\0") { return nil }
+            if component == ".." {
+                guard combined.count > rootParts.count else { return nil }
+                combined.removeLast()
+                continue
+            }
+            combined.append(component)
+        }
+        if combined.isEmpty { return "/" }
+        return "/" + combined.joined(separator: "/")
+    }
+
+    static func isPartialUpload(_ name: String) -> Bool {
+        name.hasPrefix(".saddle-") && name.hasSuffix(".part")
+    }
+
+    private static func parts(of path: String) -> [String] {
+        path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    }
 }
 
 /// One SSH connection to a server with a small pool of multiplexed SFTP channels.
 ///
-/// All operations go through `perform(_:)`, which reconnects once and retries if the
-/// connection was lost (sleep/wake, Wi-Fi changes, server timeouts).
+/// Citadel 0.12's `SFTPClient` tracks in-flight requests in a dictionary that is not
+/// safe for overlapping calls, so each channel is used by one operation at a time.
+/// Reads are retried once after a dropped connection. Mutations are not: a delete or
+/// rename that succeeded on the server but lost its reply must not be blindly repeated.
 actor SFTPSession {
-    let profile: ConnectionProfile
+    private(set) var profile: ConnectionProfile
+
+    private struct Slot {
+        var client: SFTPClient
+        var busy: Bool
+    }
 
     private var client: SSHClient?
-    private var channels: [SFTPClient] = []
-    private var nextChannel = 0
+    private var slots: [Slot] = []
     private var connecting: Task<SSHClient, Error>?
     private var keepAlive: Task<Void, Never>?
     private var lastActivity = Date()
@@ -69,16 +111,32 @@ actor SFTPSession {
         self.profile = profile
     }
 
+    /// Applies a profile edited while the domain is mounted.
+    /// Connection-defining changes drop the session so the next call reconnects.
+    func adopt(_ profile: ConnectionProfile) async {
+        let reconnect = profile.host != self.profile.host
+            || profile.port != self.profile.port
+            || profile.username != self.profile.username
+            || profile.remotePath != self.profile.remotePath
+            || profile.authMethod != self.profile.authMethod
+            || profile.privateKeyName != self.profile.privateKeyName
+        self.profile = profile
+        if reconnect {
+            await close()
+        }
+    }
+
     // MARK: - Connection lifecycle
 
     /// Connects (if needed) and resolves the root directory.
     @discardableResult
     func connect() async throws -> String {
         if let rootPath, client?.isConnected == true { return rootPath }
-        let sftp = try await channel()
         let requested = profile.remotePath.trimmingCharacters(in: .whitespaces)
-        let resolved = try await sftp.getRealPath(atPath: requested.isEmpty ? "." : requested)
-        let attributes = try await sftp.getAttributes(at: resolved)
+        let resolved = try await withChannel { sftp in
+            try await sftp.getRealPath(atPath: requested.isEmpty ? "." : requested)
+        }
+        let attributes = try await withChannel { try await $0.getAttributes(at: resolved) }
         guard Self.kind(of: attributes) == .directory else { throw SaddleError.notADirectory(resolved) }
         rootPath = resolved
         return resolved
@@ -87,11 +145,15 @@ actor SFTPSession {
     func close() async {
         keepAlive?.cancel()
         keepAlive = nil
-        let open = channels
-        channels.removeAll()
-        for channel in open { try? await channel.close() }
-        try? await client?.close()
+        rootPath = nil
+        let open = slots.map(\.client)
+        slots.removeAll()
+        let oldClient = client
         client = nil
+        connecting?.cancel()
+        connecting = nil
+        for channel in open { try? await channel.close() }
+        try? await oldClient?.close()
     }
 
     private func sshClient() async throws -> SSHClient {
@@ -105,7 +167,7 @@ actor SFTPSession {
 
         let newClient = try await task.value
         client = newClient
-        channels.removeAll()
+        slots.removeAll()
         startKeepAlive()
         return newClient
     }
@@ -135,23 +197,38 @@ actor SFTPSession {
             if let clientError = error as? SSHClientError, case .allAuthenticationOptionsFailed = clientError {
                 throw SaddleError.authenticationFailed
             }
-            throw SaddleError.connectionFailed(String(describing: error))
+            throw SaddleError.connectionFailed(publicDescription(of: error))
         }
+    }
+
+    /// Avoid writing passwords, passphrases, or key material into the activity log.
+    static func publicDescription(of error: Error) -> String {
+        let text = String(describing: error).replacingOccurrences(of: "\n", with: " ")
+        let lower = text.lowercased()
+        if lower.contains("private key") || lower.contains("passphrase") || lower.contains("password") {
+            return "the secure connection could not be established"
+        }
+        return String(text.prefix(300))
     }
 
     private func makeSettings() throws -> (settings: SSHClientSettings, validator: KnownHostValidator) {
         let username = profile.username
         let authentication: SSHAuthenticationMethod
+        let shared = SecretStore.sharesWithExtension
 
         switch profile.authMethod {
         case .password:
             guard let password = SecretStore.string(for: profile.id, kind: .password) else {
-                throw SaddleError.missingCredentials("no password saved for \(profile.displayName)")
+                throw SaddleError.missingCredentials(shared
+                    ? "no password saved for \(profile.displayName)"
+                    : "no password is available to the file provider for \(profile.displayName). Sign Saddle with a development team so the shared Keychain works.")
             }
             authentication = .passwordBased(username: username, password: password)
         case .privateKey:
             guard let keyText = SecretStore.string(for: profile.id, kind: .privateKey) else {
-                throw SaddleError.missingCredentials("no private key imported for \(profile.displayName)")
+                throw SaddleError.missingCredentials(shared
+                    ? "no private key imported for \(profile.displayName)"
+                    : "no private key is available to the file provider for \(profile.displayName). Sign Saddle with a development team so the shared Keychain works.")
             }
             let passphrase = SecretStore.data(for: profile.id, kind: .passphrase)
             authentication = try Self.keyAuthentication(username: username, keyText: keyText, passphrase: passphrase)
@@ -195,39 +272,110 @@ actor SFTPSession {
         }
     }
 
-    /// Returns an SFTP channel, opening up to `maxConnections` channels round-robin.
-    private func channel() async throws -> SFTPClient {
-        let ssh = try await sshClient()
-        channels.removeAll { !$0.isActive }
-        lastActivity = Date()
-
-        if channels.count < max(1, profile.maxConnections) {
-            let opened = try await ssh.openSFTP()
-            channels.append(opened)
-            return opened
+    /// One in-flight operation per channel. Opens up to `maxConnections` channels.
+    private func acquire(touchActivity: Bool) async throws -> SFTPClient {
+        let limit = max(1, profile.maxConnections)
+        for _ in 0..<600 {
+            try Task.checkCancellation()
+            slots.removeAll { !$0.busy && !$0.client.isActive }
+            if let index = slots.firstIndex(where: { !$0.busy }) {
+                slots[index].busy = true
+                if touchActivity { lastActivity = Date() }
+                return slots[index].client
+            }
+            if slots.count < limit {
+                let ssh = try await sshClient()
+                slots.removeAll { !$0.busy && !$0.client.isActive }
+                if let index = slots.firstIndex(where: { !$0.busy }) {
+                    slots[index].busy = true
+                    if touchActivity { lastActivity = Date() }
+                    return slots[index].client
+                }
+                if slots.count < limit {
+                    let opened = try await ssh.openSFTP()
+                    slots.append(Slot(client: opened, busy: true))
+                    if touchActivity { lastActivity = Date() }
+                    return opened
+                }
+            }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        nextChannel = (nextChannel + 1) % channels.count
-        return channels[nextChannel]
+        throw SaddleError.connectionFailed("timed out waiting for a free SFTP channel")
     }
 
-    /// Runs `operation`, reconnecting and retrying once if the connection dropped.
-    private func perform<T>(_ operation: (SFTPClient) async throws -> T) async throws -> T {
+    private func release(_ client: SFTPClient) {
+        if let index = slots.firstIndex(where: { $0.client === client }) {
+            slots[index].busy = false
+        }
+    }
+
+    private func withChannel<T>(_ operation: (SFTPClient) async throws -> T, touchActivity: Bool = true) async throws -> T {
+        let client = try await acquire(touchActivity: touchActivity)
         do {
-            return try await operation(try await channel())
+            let value = try await operation(client)
+            release(client)
+            return value
+        } catch {
+            release(client)
+            throw error
+        }
+    }
+
+    /// Runs a read, reconnecting and retrying once if the connection dropped.
+    /// Do not use this for delete, rename, or upload.
+    private func performRead<T>(_ operation: (SFTPClient) async throws -> T) async throws -> T {
+        do {
+            return try await withChannel(operation)
         } catch {
             guard Self.isConnectionError(error) else { throw error }
             await close()
-            return try await operation(try await channel())
+            return try await withChannel(operation)
         }
     }
 
-    private static func isConnectionError(_ error: Error) -> Bool {
-        if error is SFTPMessage.Status || error is SaddleError || error is CancellationError { return false }
-        if let sftpError = error as? SFTPError, case .errorStatus = sftpError { return false }
-        return true
+    static func statusCode(_ error: Error) -> SFTPStatusCode? {
+        if let status = error as? SFTPMessage.Status { return status.errorCode }
+        if let sftpError = error as? SFTPError, case .errorStatus(let status) = sftpError {
+            return status.errorCode
+        }
+        return nil
+    }
+
+    static func isMissing(_ error: Error) -> Bool {
+        statusCode(error) == .noSuchFile
+    }
+
+    /// Local I/O and SFTP status codes are not connection losses. Retrying them
+    /// closed every channel and repeated deletes and renames.
+    static func isConnectionError(_ error: Error) -> Bool {
+        if error is CancellationError || error is SaddleError || error is CocoaError { return false }
+        if statusCode(error) != nil { return false }
+        if let sftpError = error as? SFTPError {
+            switch sftpError {
+            case .connectionClosed, .missingResponse: return true
+            default: return false
+            }
+        }
+        if error is SSHClientError { return true }
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain || nsError.domain == NSFileProviderErrorDomain { return false }
+        if nsError.domain == NSPOSIXErrorDomain {
+            switch POSIXErrorCode(rawValue: Int32(nsError.code)) {
+            case .ECONNRESET, .ENOTCONN, .EPIPE, .ETIMEDOUT, .ECONNABORTED, .ENETDOWN, .ENETRESET, .EHOSTUNREACH, .ENETUNREACH:
+                return true
+            default:
+                return false
+            }
+        }
+        let description = String(describing: error).lowercased()
+        return description.contains("connection reset")
+            || description.contains("broken pipe")
+            || description.contains("connection closed")
+            || description.contains("not active")
     }
 
     /// Sends a cheap SFTP request every 30s while idle so NATs and servers keep the session open.
+    /// Skipped while any channel is busy so the ping can't overlap another request on that channel.
     private func startKeepAlive() {
         keepAlive?.cancel()
         keepAlive = Task { [weak self] in
@@ -239,29 +387,32 @@ actor SFTPSession {
     }
 
     private func pingIfIdle() async {
-        guard Date().timeIntervalSince(lastActivity) >= 25, let channel = channels.first(where: \.isActive) else { return }
-        _ = try? await channel.getRealPath(atPath: ".")
+        guard Date().timeIntervalSince(lastActivity) >= 25 else { return }
+        guard slots.contains(where: { !$0.busy && $0.client.isActive }) else { return }
+        _ = try? await withChannel({ client in
+            _ = try await client.getRealPath(atPath: ".")
+        }, touchActivity: false)
     }
 
     // MARK: - Metadata
 
     func list(_ path: String) async throws -> [RemoteEntry] {
-        try await perform { sftp in
+        try await performRead { sftp in
             let names = try await sftp.listDirectory(atPath: path)
             var entries: [RemoteEntry] = []
             for component in names.flatMap(\.components) {
                 let name = component.filename
-                guard name != ".", name != ".." else { continue }
-                if !profile.showHiddenFiles, name.hasPrefix(".") { continue }
-                // In-flight uploads from `upload(from:to:progress:)`.
-                if name.hasPrefix(".saddle-"), name.hasSuffix(".part") { continue }
+                guard RemotePath.isSafeComponent(name) else { continue }
+                // In-flight uploads. Hidden from Finder so a half-written file is never opened.
+                if RemotePath.isPartialUpload(name) { continue }
                 let childPath = RemotePath.join(path, name)
 
                 if Self.isSymlink(component.attributes, longname: component.longname) {
-                    // Follow the link so Finder sees the target's type and size. Skip dangling links.
-                    guard let target = try? await sftp.getAttributes(at: childPath) else { continue }
-                    var entry = Self.entry(path: childPath, attributes: target, longname: "")
+                    // Do not follow the link. A directory link would let Finder walk out of the mount,
+                    // and a recursive delete would then operate on the target.
+                    var entry = Self.entry(path: childPath, attributes: component.attributes, longname: component.longname)
                     entry.isSymlink = true
+                    entry.kind = .file
                     entries.append(entry)
                 } else {
                     entries.append(Self.entry(path: childPath, attributes: component.attributes, longname: component.longname))
@@ -272,7 +423,7 @@ actor SFTPSession {
     }
 
     func stat(_ path: String) async throws -> RemoteEntry {
-        try await perform { sftp in
+        try await performRead { sftp in
             Self.entry(path: path, attributes: try await sftp.getAttributes(at: path), longname: "")
         }
     }
@@ -281,8 +432,9 @@ actor SFTPSession {
         do {
             _ = try await stat(path)
             return true
-        } catch let status as SFTPMessage.Status where status.errorCode == .noSuchFile {
-            return false
+        } catch {
+            if Self.isMissing(error) { return false }
+            throw error
         }
     }
 
@@ -290,7 +442,7 @@ actor SFTPSession {
 
     /// Streams a remote file to `localURL` in chunks, reporting cumulative bytes.
     func download(_ path: String, to localURL: URL, progress: @Sendable (Int64) -> Void) async throws {
-        try await perform { sftp in
+        try await performRead { sftp in
             FileManager.default.createFile(atPath: localURL.path, contents: nil)
             let output = try FileHandle(forWritingTo: localURL)
             defer { try? output.close() }
@@ -317,11 +469,16 @@ actor SFTPSession {
 
     /// Uploads `localURL` (or an empty file when nil) to `path`.
     ///
-    /// Data is written to a temporary sibling first and renamed into place, so an
-    /// interrupted upload never leaves a truncated file behind.
+    /// Bytes land in a temporary sibling first. The destination is renamed aside and
+    /// the temporary file renamed into place, then the aside copy is removed. The
+    /// previous file is not deleted until the new bytes are complete, and it is put
+    /// back if the final rename fails.
     func upload(from localURL: URL?, to path: String, progress: @Sendable (Int64) -> Void) async throws {
-        let temporary = RemotePath.join(RemotePath.parent(of: path), ".saddle-\(UUID().uuidString.prefix(8)).part")
-        try await perform { sftp in
+        let parent = RemotePath.parent(of: path)
+        let temporary = RemotePath.join(parent, ".saddle-\(UUID().uuidString).part")
+        let backup = RemotePath.join(parent, ".saddle-\(UUID().uuidString).bak")
+
+        try await withChannel { sftp in
             let file = try await sftp.openFile(filePath: temporary, flags: [.write, .create, .truncate])
             do {
                 if let localURL {
@@ -342,26 +499,56 @@ actor SFTPSession {
                 throw error
             }
 
-            // SFTP v3 rename refuses to overwrite, so replace the destination explicitly.
-            if (try? await sftp.getAttributes(at: path)) != nil {
-                try await sftp.remove(at: path)
+            let replaced = (try? await sftp.getAttributes(at: path)) != nil
+            if replaced {
+                do {
+                    try await sftp.rename(at: path, to: backup)
+                } catch {
+                    try? await sftp.remove(at: temporary)
+                    throw error
+                }
             }
-            try await sftp.rename(at: temporary, to: path)
+            do {
+                try await sftp.rename(at: temporary, to: path)
+            } catch {
+                if replaced {
+                    try? await sftp.rename(at: backup, to: path)
+                }
+                try? await sftp.remove(at: temporary)
+                throw error
+            }
+            if replaced {
+                try? await sftp.remove(at: backup)
+            }
         }
     }
 
     // MARK: - Mutations
 
     func createDirectory(_ path: String) async throws {
-        try await perform { try await $0.createDirectory(atPath: path) }
+        try await withChannel { try await $0.createDirectory(atPath: path) }
     }
 
     func rename(_ path: String, to newPath: String) async throws {
-        try await perform { try await $0.rename(at: path, to: newPath) }
+        do {
+            try await withChannel { try await $0.rename(at: path, to: newPath) }
+        } catch {
+            guard Self.isConnectionError(error) else { throw error }
+            // The reply may have been lost after the server applied the rename.
+            await close()
+            let sourceExists = (try? await exists(path)) ?? false
+            let destinationExists = (try? await exists(newPath)) ?? false
+            if !sourceExists && destinationExists { return }
+            if sourceExists && !destinationExists {
+                try await withChannel { try await $0.rename(at: path, to: newPath) }
+                return
+            }
+            throw error
+        }
     }
 
     func setModificationDate(_ date: Date, for path: String) async throws {
-        try await perform { sftp in
+        try await withChannel { sftp in
             var attributes = SFTPFileAttributes()
             attributes.accessModificationTime = .init(accessTime: date, modificationTime: date)
             try await sftp.setAttributes(at: path, to: attributes)
@@ -369,15 +556,21 @@ actor SFTPSession {
     }
 
     func setPermissions(_ permissions: UInt32, for path: String) async throws {
-        try await perform { sftp in
+        try await withChannel { sftp in
             var attributes = SFTPFileAttributes()
             attributes.permissions = permissions & 0o7777
             try await sftp.setAttributes(at: path, to: attributes)
         }
     }
 
+    /// Missing files count as success so a lost reply doesn't abort a recursive delete.
     func removeFile(_ path: String) async throws {
-        try await perform { try await $0.remove(at: path) }
+        do {
+            try await withChannel { try await $0.remove(at: path) }
+        } catch {
+            if Self.isMissing(error) { return }
+            throw error
+        }
     }
 
     /// Removes a directory. With `recursive`, deletes its contents first (depth-first).
@@ -391,19 +584,27 @@ actor SFTPSession {
                 }
             }
         }
-        try await perform { try await $0.rmdir(at: path) }
+        do {
+            try await withChannel { try await $0.rmdir(at: path) }
+        } catch {
+            if Self.isMissing(error) { return }
+            throw error
+        }
     }
 
     /// Children without following symlinks, so recursive deletes never escape the tree.
     private func rawChildren(of path: String) async throws -> [RemoteEntry] {
-        try await perform { sftp in
+        try await performRead { sftp in
             try await sftp.listDirectory(atPath: path)
                 .flatMap(\.components)
-                .filter { $0.filename != "." && $0.filename != ".." }
+                .filter { RemotePath.isSafeComponent($0.filename) }
                 .map { component in
                     var entry = Self.entry(path: RemotePath.join(path, component.filename),
                                            attributes: component.attributes, longname: component.longname)
-                    if Self.isSymlink(component.attributes, longname: component.longname) { entry.kind = .file }
+                    if Self.isSymlink(component.attributes, longname: component.longname) {
+                        entry.isSymlink = true
+                        entry.kind = .file
+                    }
                     return entry
                 }
         }
