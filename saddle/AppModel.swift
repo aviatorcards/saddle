@@ -238,7 +238,8 @@ final class AppModel {
 
     // MARK: - User interaction
 
-    /// Presents the alert on the main queue without holding the main actor across `runModal`.
+    /// Presents the alert from a fresh main-queue turn instead of inside the caller's task.
+    /// `runModal` still blocks the main thread until the user answers.
     private func confirmTrust(host: String, fingerprint: String, previousFingerprint: String?) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async {

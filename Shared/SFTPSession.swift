@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import FileProvider
 import Citadel
 import NIOCore
 
@@ -16,10 +17,11 @@ nonisolated struct RemoteEntry: Sendable, Hashable {
     var size: UInt64
     var modified: Date
     var permissions: UInt32
-    /// True when the entry was reached through a symbolic link (attributes are the link's, not the target's).
+    /// True when the entry is a symbolic link. Links that resolve inside the mount carry
+    /// their target's attributes, so a link to a folder is browsable like that folder.
     var isSymlink = false
 
-    var isDirectory: Bool { kind == .directory && !isSymlink }
+    var isDirectory: Bool { kind == .directory }
 
     /// Changes whenever the content changes. Size + mtime is all SFTP v3 gives us.
     /// Mtime is whole seconds, so two edits in the same second with the same size compare equal.
@@ -76,6 +78,28 @@ nonisolated enum RemotePath {
         name.hasPrefix(".saddle-") && name.hasSuffix(".part")
     }
 
+    /// Name for the copy an overwrite moves aside. It records the original name, so a
+    /// listing can hide a backup while the original exists and show it if it doesn't.
+    static func backupName(for original: String) -> String {
+        let tag = UUID().uuidString.prefix(8).lowercased()
+        let name = ".saddle-\(tag).\(original).bak"
+        return name.utf8.count <= 255 ? name : ".saddle-\(UUID().uuidString).bak"
+    }
+
+    /// The original file name recorded by `backupName(for:)`, if this is such a backup.
+    static func originalName(ofBackup name: String) -> String? {
+        guard name.hasPrefix(".saddle-"), name.hasSuffix(".bak") else { return nil }
+        let body = name.dropFirst(".saddle-".count).dropLast(".bak".count)
+        guard body.count > 9, body[body.index(body.startIndex, offsetBy: 8)] == "." else { return nil }
+        let original = String(body.dropFirst(9))
+        return isSafeComponent(original) ? original : nil
+    }
+
+    /// Whether `path` is `root` or below it. Both must already be canonical (realpath'd).
+    static func isInside(_ path: String, root: String) -> Bool {
+        root == "/" || path == root || path.hasPrefix(root + "/")
+    }
+
     private static func parts(of path: String) -> [String] {
         path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
     }
@@ -83,20 +107,18 @@ nonisolated enum RemotePath {
 
 /// One SSH connection to a server with a small pool of multiplexed SFTP channels.
 ///
-/// Citadel 0.12's `SFTPClient` tracks in-flight requests in a dictionary that is not
-/// safe for overlapping calls, so each channel is used by one operation at a time.
+/// Citadel's `SFTPClient` matches replies to requests by ID on the channel's event loop,
+/// so operations can overlap on one channel. Channels are opened up to `maxConnections`
+/// and shared round-robin, so a long transfer never blocks a listing.
 /// Reads are retried once after a dropped connection. Mutations are not: a delete or
 /// rename that succeeded on the server but lost its reply must not be blindly repeated.
 actor SFTPSession {
     private(set) var profile: ConnectionProfile
 
-    private struct Slot {
-        var client: SFTPClient
-        var busy: Bool
-    }
-
     private var client: SSHClient?
-    private var slots: [Slot] = []
+    private var channels: [SFTPClient] = []
+    private var nextChannel = 0
+    private var openingChannels = 0
     private var connecting: Task<SSHClient, Error>?
     private var keepAlive: Task<Void, Never>?
     private var lastActivity = Date()
@@ -146,8 +168,8 @@ actor SFTPSession {
         keepAlive?.cancel()
         keepAlive = nil
         rootPath = nil
-        let open = slots.map(\.client)
-        slots.removeAll()
+        let open = channels
+        channels.removeAll()
         let oldClient = client
         client = nil
         connecting?.cancel()
@@ -167,7 +189,7 @@ actor SFTPSession {
 
         let newClient = try await task.value
         client = newClient
-        slots.removeAll()
+        channels.removeAll()
         startKeepAlive()
         return newClient
     }
@@ -272,53 +294,34 @@ actor SFTPSession {
         }
     }
 
-    /// One in-flight operation per channel. Opens up to `maxConnections` channels.
+    /// Returns a channel for the next operation. Opens channels up to `maxConnections`,
+    /// then shares them round-robin. Requests overlap safely on one channel.
     private func acquire(touchActivity: Bool) async throws -> SFTPClient {
         let limit = max(1, profile.maxConnections)
-        for _ in 0..<600 {
+        while true {
             try Task.checkCancellation()
-            slots.removeAll { !$0.busy && !$0.client.isActive }
-            if let index = slots.firstIndex(where: { !$0.busy }) {
-                slots[index].busy = true
-                if touchActivity { lastActivity = Date() }
-                return slots[index].client
-            }
-            if slots.count < limit {
-                let ssh = try await sshClient()
-                slots.removeAll { !$0.busy && !$0.client.isActive }
-                if let index = slots.firstIndex(where: { !$0.busy }) {
-                    slots[index].busy = true
-                    if touchActivity { lastActivity = Date() }
-                    return slots[index].client
-                }
-                if slots.count < limit {
-                    let opened = try await ssh.openSFTP()
-                    slots.append(Slot(client: opened, busy: true))
-                    if touchActivity { lastActivity = Date() }
-                    return opened
-                }
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw SaddleError.connectionFailed("timed out waiting for a free SFTP channel")
-    }
+            channels.removeAll { !$0.isActive }
+            if touchActivity { lastActivity = Date() }
 
-    private func release(_ client: SFTPClient) {
-        if let index = slots.firstIndex(where: { $0.client === client }) {
-            slots[index].busy = false
+            if channels.count + openingChannels < limit {
+                let ssh = try await sshClient()
+                openingChannels += 1
+                defer { openingChannels -= 1 }
+                let opened = try await ssh.openSFTP()
+                channels.append(opened)
+                return opened
+            }
+            if !channels.isEmpty {
+                nextChannel = (nextChannel + 1) % channels.count
+                return channels[nextChannel]
+            }
+            // Every allowed channel is still being opened by another caller.
+            try await Task.sleep(for: .milliseconds(20))
         }
     }
 
     private func withChannel<T>(_ operation: (SFTPClient) async throws -> T, touchActivity: Bool = true) async throws -> T {
-        let client = try await acquire(touchActivity: touchActivity)
-        do {
-            let value = try await operation(client)
-            release(client)
-            return value
-        } catch {
-            release(client)
-            throw error
-        }
+        try await operation(try await acquire(touchActivity: touchActivity))
     }
 
     /// Runs a read, reconnecting and retrying once if the connection dropped.
@@ -375,7 +378,6 @@ actor SFTPSession {
     }
 
     /// Sends a cheap SFTP request every 30s while idle so NATs and servers keep the session open.
-    /// Skipped while any channel is busy so the ping can't overlap another request on that channel.
     private func startKeepAlive() {
         keepAlive?.cancel()
         keepAlive = Task { [weak self] in
@@ -387,38 +389,58 @@ actor SFTPSession {
     }
 
     private func pingIfIdle() async {
-        guard Date().timeIntervalSince(lastActivity) >= 25 else { return }
-        guard slots.contains(where: { !$0.busy && $0.client.isActive }) else { return }
-        _ = try? await withChannel({ client in
-            _ = try await client.getRealPath(atPath: ".")
-        }, touchActivity: false)
+        guard Date().timeIntervalSince(lastActivity) >= 25, let channel = channels.first(where: \.isActive) else { return }
+        _ = try? await channel.getRealPath(atPath: ".")
     }
 
     // MARK: - Metadata
 
     func list(_ path: String) async throws -> [RemoteEntry] {
         try await performRead { sftp in
-            let names = try await sftp.listDirectory(atPath: path)
+            let components = try await sftp.listDirectory(atPath: path).flatMap(\.components)
+            let names = Set(components.map(\.filename))
             var entries: [RemoteEntry] = []
-            for component in names.flatMap(\.components) {
+            for component in components {
                 let name = component.filename
                 guard RemotePath.isSafeComponent(name) else { continue }
                 // In-flight uploads. Hidden from Finder so a half-written file is never opened.
                 if RemotePath.isPartialUpload(name) { continue }
+                // An overwrite's backup is only worth showing if the original went missing,
+                // because then it's the only copy of the previous version.
+                if let original = RemotePath.originalName(ofBackup: name), names.contains(original) { continue }
                 let childPath = RemotePath.join(path, name)
 
                 if Self.isSymlink(component.attributes, longname: component.longname) {
-                    // Do not follow the link. A directory link would let Finder walk out of the mount,
-                    // and a recursive delete would then operate on the target.
-                    var entry = Self.entry(path: childPath, attributes: component.attributes, longname: component.longname)
-                    entry.isSymlink = true
-                    entry.kind = .file
-                    entries.append(entry)
+                    // Links that resolve inside the mount look like their targets. Links that
+                    // point outside it, or nowhere, are left out so Finder can't leave the mount.
+                    guard let link = try await followLink(childPath, using: sftp) else { continue }
+                    entries.append(link.entry)
                 } else {
                     entries.append(Self.entry(path: childPath, attributes: component.attributes, longname: component.longname))
                 }
             }
             return entries
+        }
+    }
+
+    /// Metadata for a symbolic link's target, and the target's canonical path.
+    /// Nil when the link is dangling or resolves outside the mounted folder.
+    func resolveLink(_ path: String) async throws -> (entry: RemoteEntry, target: String)? {
+        try await performRead { try await followLink(path, using: $0) }
+    }
+
+    private func followLink(_ path: String, using sftp: SFTPClient) async throws -> (entry: RemoteEntry, target: String)? {
+        guard let rootPath else { return nil }
+        do {
+            let target = try await sftp.getRealPath(atPath: path)
+            guard RemotePath.isInside(target, root: rootPath) else { return nil }
+            var entry = Self.entry(path: path, attributes: try await sftp.getAttributes(at: target), longname: "")
+            entry.isSymlink = true
+            return (entry, target)
+        } catch {
+            // Server-side failures (dangling link, no permission) just mean "don't show it".
+            if Self.statusCode(error) != nil { return nil }
+            throw error
         }
     }
 
@@ -476,7 +498,7 @@ actor SFTPSession {
     func upload(from localURL: URL?, to path: String, progress: @Sendable (Int64) -> Void) async throws {
         let parent = RemotePath.parent(of: path)
         let temporary = RemotePath.join(parent, ".saddle-\(UUID().uuidString).part")
-        let backup = RemotePath.join(parent, ".saddle-\(UUID().uuidString).bak")
+        let backup = RemotePath.join(parent, RemotePath.backupName(for: RemotePath.name(of: path)))
 
         try await withChannel { sftp in
             let file = try await sftp.openFile(filePath: temporary, flags: [.write, .create, .truncate])

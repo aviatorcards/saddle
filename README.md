@@ -14,8 +14,6 @@ Open `saddle.xcodeproj` and run the `saddle` scheme. The extension is embedded i
 xcodebuild test -project saddle.xcodeproj -scheme saddle -destination 'platform=macOS' -only-testing:saddleTests
 ```
 
-There is no Swift toolchain in the environment that produced the current branch, so those tests were not executed here.
-
 ## How a connection works
 
 1. You save a host, a remote folder, and either a password or an OpenSSH private key (Ed25519 or RSA). Secrets go to the shared keychain, not `profiles.json`.
@@ -27,6 +25,7 @@ Deletes are permanent. SFTP has no trash.
 ## Limits worth knowing
 
 - Versions are the remote size plus modification time in whole seconds. Two different edits in the same second with the same size look identical, and the later upload can replace the earlier one.
-- Symbolic links are shown, but not followed. Saddle will not open or write through a link, and a recursive delete unlinks the link instead of walking its target.
+- Symbolic links that resolve inside the mounted folder appear as their targets, so a linked folder is browsable and a linked file opens and saves normally (saves go to the target). Links that point outside the mounted folder, or nowhere, are not shown. Deleting a link only removes the link, and a recursive delete never walks into a linked folder.
+- Overwriting a file moves the previous version aside as `.saddle-<id>.<name>.bak` until the new bytes are in place. If an upload is interrupted and the original is missing, that backup stays visible so you can recover it.
 - `~/.ssh/config` import follows OpenSSH's "first value wins" rule and skips `Match` and `Include`.
 - Changing a password or key passphrase on a connection that is already mounted takes effect the next time that SSH session reconnects. Changing the host, user, port, remote folder, or key file drops the session immediately.
