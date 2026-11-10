@@ -219,6 +219,12 @@ actor SFTPSession {
             if let clientError = error as? SSHClientError, case .allAuthenticationOptionsFailed = clientError {
                 throw SaddleError.authenticationFailed
             }
+            // macOS Local Network privacy blocks connections as EHOSTUNREACH ("No route to host").
+            let description = String(describing: error)
+            if description.contains("No route to host") || description.contains("errno: 65") {
+                throw SaddleError.connectionFailed(
+                    "no route to \(settings.host). If it's on your local network, allow Saddle in System Settings › Privacy & Security › Local Network.")
+            }
             throw SaddleError.connectionFailed(publicDescription(of: error))
         }
     }
