@@ -19,5 +19,12 @@ import SwiftUI
         }
         .defaultSize(width: 760, height: 520)
         .windowResizability(.contentMinSize)
+
+        Settings {
+            SettingsView()
+                .environment(model)
+        }
+        .defaultSize(width: 560, height: 440)
+        .windowResizability(.contentSize)
     }
 }

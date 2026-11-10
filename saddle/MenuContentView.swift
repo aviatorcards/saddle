@@ -4,6 +4,7 @@ import SwiftUI
 struct MenuContentView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -11,12 +12,17 @@ struct MenuContentView: View {
                 Text("Saddle")
                     .font(.headline)
                 Spacer()
-                Button("Refresh All", systemImage: "arrow.clockwise") {
-                    Task { await model.refreshAll() }
+                HStack(spacing: 8) {
+                    Button("Refresh All", systemImage: "arrow.clockwise") {
+                        Task { await model.refreshAll() }
+                    }
+                    .help("Check all connected servers for changes")
+
+                    Button("Settings…", systemImage: "gearshape", action: showSettings)
+                        .help("Settings… (⌘,)")
                 }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.borderless)
-                .help("Check all connected servers for changes")
             }
 
             if model.profiles.isEmpty {
@@ -57,6 +63,7 @@ struct MenuContentView: View {
             HStack {
                 Button("Manage Connections…", action: showConnections)
                 Spacer()
+                Button("Settings…", action: showSettings)
                 Button("Quit Saddle") { NSApp.terminate(nil) }
             }
             .buttonStyle(.borderless)
@@ -68,6 +75,12 @@ struct MenuContentView: View {
     private func showConnections() {
         openWindow(id: ConnectionsView.windowID)
         WindowActivation.bringToFront(windowTitled: "Connections")
+    }
+
+    private func showSettings() {
+        NSApp.setActivationPolicy(.regular)
+        openSettings()
+        WindowActivation.bringSettingsToFront()
     }
 }
 

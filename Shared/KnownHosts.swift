@@ -41,6 +41,59 @@ nonisolated enum KnownHosts {
         }
     }
 
+    struct HostEntry: Identifiable, Hashable, Sendable {
+        public var id: String { key }
+        public let key: String
+        public let host: String
+        public let port: Int
+        public let keyType: String
+        public let fingerprint: String
+        public let openSSHKey: String
+
+        public init(key: String, host: String, port: Int, keyType: String, fingerprint: String, openSSHKey: String) {
+            self.key = key
+            self.host = host
+            self.port = port
+            self.keyType = keyType
+            self.fingerprint = fingerprint
+            self.openSSHKey = openSSHKey
+        }
+    }
+
+    static func parseKey(_ key: String) -> (host: String, port: Int) {
+        if key.hasPrefix("[") && key.contains("]:") {
+            let withoutLeadingBracket = key.dropFirst()
+            let parts = withoutLeadingBracket.split(separator: "]:", maxSplits: 1)
+            if parts.count == 2, let port = Int(parts[1]) {
+                return (String(parts[0]), port)
+            }
+        }
+        return (key, 22)
+    }
+
+    static func allEntries() -> [HostEntry] {
+        let stored = readStore()
+        return stored.map { key, openSSHKey in
+            let (host, port) = parseKey(key)
+            let keyType = String(openSSHKey.split(separator: " ").first ?? "unknown")
+            let fp = fingerprint(ofOpenSSHKey: openSSHKey)
+            return HostEntry(
+                key: key,
+                host: host,
+                port: port,
+                keyType: keyType,
+                fingerprint: fp,
+                openSSHKey: openSSHKey
+            )
+        }.sorted { ($0.host, $0.port) < ($1.host, $1.port) }
+    }
+
+    static func forgetAll() {
+        try? mutateStore { stored in
+            stored.removeAll()
+        }
+    }
+
     /// The app and the extension are different processes. The in-memory mutex is not enough.
     private static func readStore() -> [String: String] {
         (try? FileLock.withLock(url: url) {
