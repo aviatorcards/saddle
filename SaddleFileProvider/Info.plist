@@ -10,6 +10,25 @@
 		<string>com.apple.fileprovider-nonui</string>
 		<key>NSExtensionPrincipalClass</key>
 		<string>$(PRODUCT_MODULE_NAME).FileProviderExtension</string>
+		<key>NSExtensionFileProviderActions</key>
+		<array>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>dev.fddl.saddle.keepDownloaded</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Keep Downloaded</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>TRUEPREDICATE</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>dev.fddl.saddle.removeDownload</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Remove Download</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>TRUEPREDICATE</string>
+			</dict>
+		</array>
 	</dict>
 </dict>
 </plist>

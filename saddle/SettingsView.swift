@@ -141,6 +141,10 @@ private struct ConnectionDefaultsTab: View {
                 }
 
                 Toggle("Show Hidden Files", isOn: $settings.defaultShowHiddenFiles)
+                Toggle("Keep all files downloaded", isOn: $settings.defaultKeepAllDownloaded)
+                Text("New connections download every file and keep it on this Mac, so Finder doesn't show the cloud badge.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 Text("These values pre-populate fields when you click 'Add Connection' in the Connections manager.")
                     .font(.caption)
@@ -387,6 +391,8 @@ private struct AdvancedSettingsTab: View {
     }
 
     var body: some View {
+        @Bindable var settings = model.settings
+
         Form {
             Section("Shared Storage") {
                 LabeledContent("App Group Identifier") {
@@ -408,6 +414,15 @@ private struct AdvancedSettingsTab: View {
                         .controlSize(.small)
                     }
                 }
+            }
+
+            Section("Download Ahead") {
+                Toggle("Download files ahead", isOn: $settings.prefetchEnabled)
+                Stepper("Up to \(settings.prefetchMaxFileMB) MB per file", value: $settings.prefetchMaxFileMB, in: 1...64)
+                Stepper("Up to \(settings.prefetchMaxFolderMB) MB per folder", value: $settings.prefetchMaxFolderMB, in: 5...500)
+                Text("When you open a folder, Saddle fetches small files in the background so a later copy doesn't start from nothing. Hidden files, partial uploads, and links outside the mount are skipped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Activity Log") {

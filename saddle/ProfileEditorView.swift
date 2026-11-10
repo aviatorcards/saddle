@@ -64,6 +64,13 @@ struct ProfileEditorView: View {
                 }
             }
 
+            Section("Finder") {
+                Toggle("Keep all files downloaded", isOn: $draft.keepAllDownloaded)
+                Text("Downloads every file in this connection and keeps it on this Mac. You can still pin or release a single item from Finder's menu.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Advanced") {
                 Stepper("Parallel Transfers: \(draft.maxConnections)", value: $draft.maxConnections, in: 1...8)
                 Picker("Check for Remote Changes", selection: $draft.refreshInterval) {
