@@ -40,15 +40,30 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
         let container = container
         let provider = provider
+        let pageSize = DirectoryPage.size(suggested: observer.suggestedPageSize == 0 ? nil : observer.suggestedPageSize)
+        let start = DirectoryPage.offset(from: page.rawValue)
         track(Task {
             do {
-                let items = try await provider.listItems(in: container)
-                let pageSize = max(1, observer.suggestedPageSize ?? 200)
-                for start in stride(from: 0, to: items.count, by: pageSize) {
-                    guard !Task.isCancelled else { return }
-                    observer.didEnumerate(Array(items[start..<min(start + pageSize, items.count)]))
+                var collected: [FileProviderItem] = []
+                var nextOffset: Int? = start
+                // A raw page can be mostly hidden names. Keep reading until this Finder page
+                // is full or the directory ends, and don't skip items that didn't fit.
+                while collected.count < pageSize {
+                    let previous = nextOffset
+                    let listed = try await provider.listPage(in: container, offset: nextOffset ?? start, limit: pageSize - collected.count)
+                    collected.append(contentsOf: listed.items)
+                    nextOffset = listed.nextOffset
+                    if nextOffset == nil || nextOffset == previous { break }
                 }
-                observer.finishEnumerating(upTo: nil)
+                if !collected.isEmpty {
+                    observer.didEnumerate(collected)
+                }
+                if let nextOffset {
+                    observer.finishEnumerating(upTo: NSFileProviderPage(rawValue: DirectoryPage.token(forOffset: nextOffset)))
+                } else {
+                    observer.finishEnumerating(upTo: nil)
+                    await provider.finishListing(in: container)
+                }
             } catch {
                 FileProviderExtension.log.error("enumerate \(container.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 observer.finishEnumeratingWithError(FileProviderExtension.fileProviderError(error))

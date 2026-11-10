@@ -15,6 +15,10 @@ final class AppSettings {
         static let defaultParallelTransfers = "defaultParallelTransfers"
         static let defaultRefreshInterval = "defaultRefreshInterval"
         static let defaultShowHiddenFiles = "defaultShowHiddenFiles"
+        static let defaultKeepAllDownloaded = "defaultKeepAllDownloaded"
+        static let prefetchEnabled = "prefetchEnabled"
+        static let prefetchMaxFileMB = "prefetchMaxFileMB"
+        static let prefetchMaxFolderMB = "prefetchMaxFolderMB"
         static let defaultRemotePath = "defaultRemotePath"
         static let defaultPort = "defaultPort"
         static let defaultUsername = "defaultUsername"
@@ -48,6 +52,24 @@ final class AppSettings {
         didSet { defaults.set(defaultShowHiddenFiles, forKey: Keys.defaultShowHiddenFiles) }
     }
 
+    var defaultKeepAllDownloaded: Bool {
+        didSet { defaults.set(defaultKeepAllDownloaded, forKey: Keys.defaultKeepAllDownloaded) }
+    }
+
+    var prefetchEnabled: Bool {
+        didSet { defaults.set(prefetchEnabled, forKey: Keys.prefetchEnabled); writeTuning() }
+    }
+
+    var prefetchMaxFileMB: Int {
+        didSet { defaults.set(prefetchMaxFileMB, forKey: Keys.prefetchMaxFileMB); writeTuning() }
+    }
+
+    var prefetchMaxFolderMB: Int {
+        didSet { defaults.set(prefetchMaxFolderMB, forKey: Keys.prefetchMaxFolderMB); writeTuning() }
+    }
+
+    private let writesTuning: Bool
+
     var defaultRemotePath: String {
         didSet { defaults.set(defaultRemotePath, forKey: Keys.defaultRemotePath) }
     }
@@ -73,6 +95,7 @@ final class AppSettings {
 
     init(userDefaults: UserDefaults = .standard) {
         self.defaults = userDefaults
+        self.writesTuning = userDefaults == .standard
 
         // Register default values
         userDefaults.register(defaults: [
@@ -83,6 +106,10 @@ final class AppSettings {
             Keys.defaultParallelTransfers: 3,
             Keys.defaultRefreshInterval: 60.0,
             Keys.defaultShowHiddenFiles: true,
+            Keys.defaultKeepAllDownloaded: false,
+            Keys.prefetchEnabled: true,
+            Keys.prefetchMaxFileMB: 5,
+            Keys.prefetchMaxFolderMB: 50,
             Keys.defaultRemotePath: "",
             Keys.defaultPort: 22,
             Keys.defaultUsername: NSUserName(),
@@ -100,6 +127,12 @@ final class AppSettings {
         self.defaultRefreshInterval = interval >= 15 ? interval : 60
 
         self.defaultShowHiddenFiles = userDefaults.bool(forKey: Keys.defaultShowHiddenFiles)
+        self.defaultKeepAllDownloaded = userDefaults.bool(forKey: Keys.defaultKeepAllDownloaded)
+        self.prefetchEnabled = userDefaults.object(forKey: Keys.prefetchEnabled) as? Bool ?? true
+        let fileMB = userDefaults.integer(forKey: Keys.prefetchMaxFileMB)
+        self.prefetchMaxFileMB = (1...512).contains(fileMB) ? fileMB : 5
+        let folderMB = userDefaults.integer(forKey: Keys.prefetchMaxFolderMB)
+        self.prefetchMaxFolderMB = (1...2048).contains(folderMB) ? folderMB : 50
         self.defaultRemotePath = userDefaults.string(forKey: Keys.defaultRemotePath) ?? ""
 
         let port = userDefaults.integer(forKey: Keys.defaultPort)
@@ -108,6 +141,7 @@ final class AppSettings {
         self.defaultUsername = userDefaults.string(forKey: Keys.defaultUsername) ?? NSUserName()
 
         refreshLaunchAtLoginStatus()
+        writeTuning()
     }
 
     func refreshLaunchAtLoginStatus() {
@@ -137,8 +171,20 @@ final class AppSettings {
         defaultParallelTransfers = 3
         defaultRefreshInterval = 60.0
         defaultShowHiddenFiles = true
+        defaultKeepAllDownloaded = false
+        prefetchEnabled = true
+        prefetchMaxFileMB = 5
+        prefetchMaxFolderMB = 50
         defaultRemotePath = ""
         defaultPort = 22
         defaultUsername = NSUserName()
+    }
+
+    private func writeTuning() {
+        guard writesTuning else { return }
+        FinderTuning.save(FinderTuning(
+            prefetchEnabled: prefetchEnabled,
+            maxFileBytes: Int64(prefetchMaxFileMB) * 1024 * 1024,
+            maxFolderBytes: Int64(prefetchMaxFolderMB) * 1024 * 1024))
     }
 }

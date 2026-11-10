@@ -238,3 +238,171 @@ final class SFTPSessionTests: XCTestCase {
         XCTAssertFalse(SFTPSession.publicDescription(of: Box(description: "connection reset by peer")).contains("\n"))
     }
 }
+
+final class DirectoryPageTests: XCTestCase {
+    func testInitialTokenStartsAtZero() {
+        XCTAssertEqual(DirectoryPage.offset(from: nil), 0)
+        XCTAssertEqual(DirectoryPage.offset(from: Data()), 0)
+        XCTAssertEqual(DirectoryPage.offset(from: Data([0, 1, 2, 3, 4])), 0)
+    }
+
+    func testPageTokensRoundTripAndStopOnTheLastPartialPage() {
+        let count = 250
+        let pageSize = 100
+        var offset = 0
+        var seen = 0
+        var pages = 0
+        while true {
+            let bounds = DirectoryPage.bounds(itemCount: count, offset: offset, pageSize: pageSize)
+            seen += bounds.end - bounds.start
+            pages += 1
+            guard let next = bounds.nextOffset else { break }
+            let token = DirectoryPage.token(forOffset: next)
+            XCTAssertEqual(DirectoryPage.offset(from: token), next)
+            offset = next
+        }
+        XCTAssertEqual(pages, 3)
+        XCTAssertEqual(seen, count)
+        XCTAssertEqual(offset, 200)
+    }
+
+    func testLargeDirectoryPagesDoNotOverlapOrDropItems() {
+        let count = 10_000
+        let pageSize = DirectoryPage.fallbackSize
+        var offset = 0
+        var covered = Array(repeating: false, count: count)
+        var pageCount = 0
+        while true {
+            let bounds = DirectoryPage.bounds(itemCount: count, offset: offset, pageSize: pageSize)
+            XCTAssertLessThanOrEqual(bounds.end - bounds.start, pageSize)
+            for index in bounds.start..<bounds.end {
+                XCTAssertFalse(covered[index])
+                covered[index] = true
+            }
+            pageCount += 1
+            guard let next = bounds.nextOffset else {
+                XCTAssertEqual(bounds.end, count)
+                break
+            }
+            offset = DirectoryPage.offset(from: DirectoryPage.token(forOffset: next))
+        }
+        XCTAssertEqual(pageCount, 100)
+        XCTAssertTrue(covered.allSatisfy { $0 })
+    }
+
+    func testSuggestedPageSizeIsCapped() {
+        XCTAssertEqual(DirectoryPage.size(suggested: nil), 100)
+        XCTAssertEqual(DirectoryPage.size(suggested: 0), 1)
+        XCTAssertEqual(DirectoryPage.size(suggested: 40), 40)
+        XCTAssertEqual(DirectoryPage.size(suggested: 5_000), DirectoryPage.maximumSize)
+    }
+}
+
+final class DownloadPinsTests: XCTestCase {
+    func testPinAndReleaseSurviveARoundTrip() throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "pins-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var pins = DownloadPins()
+        pins.pin("docs")
+        pins.pin("docs/archive")
+        pins.release("docs/archive/old")
+        try pins.save(to: url)
+        let loaded = DownloadPins.load(from: url)
+        XCTAssertTrue(loaded.keeps("docs/notes.txt", keepAll: false))
+        XCTAssertTrue(loaded.keeps("docs/archive/report.pdf", keepAll: false))
+        XCTAssertFalse(loaded.keeps("docs/archive/old", keepAll: false))
+        XCTAssertFalse(loaded.keeps("docs/archive/old/page.txt", keepAll: true))
+        XCTAssertFalse(loaded.keeps("other.txt", keepAll: false))
+        XCTAssertTrue(loaded.keeps("other.txt", keepAll: true))
+    }
+
+    func testPinningAFolderClearsReleasesInsideIt() {
+        var pins = DownloadPins()
+        pins.release("photos/trip")
+        pins.pin("photos")
+        XCTAssertTrue(pins.keeps("photos/trip/img.jpg", keepAll: false))
+        XCTAssertFalse(pins.released.contains("photos/trip"))
+    }
+
+    func testReleasingTheRootTurnsKeepAllOffForEverything() {
+        var pins = DownloadPins()
+        pins.release("")
+        XCTAssertFalse(pins.keeps("", keepAll: true))
+        XCTAssertFalse(pins.keeps("a/b", keepAll: true))
+        pins.pin("a")
+        XCTAssertTrue(pins.keeps("a/b", keepAll: true))
+    }
+}
+
+final class PrefetchPlannerTests: XCTestCase {
+    private let limits = PrefetchPlanner.Limits(enabled: true, maxFileBytes: 5 * 1024 * 1024, maxFolderBytes: 50 * 1024 * 1024)
+
+    func testCapsAndExclusions() {
+        let mb = UInt64(1024 * 1024)
+        let files = [
+            PrefetchCandidate(name: "small.txt", size: mb),
+            PrefetchCandidate(name: "huge.bin", size: 6 * mb),
+            PrefetchCandidate(name: ".secret", size: mb, isHidden: true),
+            PrefetchCandidate(name: ".saddle-1.part", size: mb, isPartial: true),
+            PrefetchCandidate(name: "outside", size: mb, isSymlink: true, symlinkEscapesMount: true),
+            PrefetchCandidate(name: "inside-link", size: 2 * mb, isSymlink: true, symlinkEscapesMount: false),
+            PrefetchCandidate(name: "folder", size: 0, isDirectory: true),
+            PrefetchCandidate(name: "also-small.txt", size: 2 * mb),
+        ]
+        let chosen = PrefetchPlanner.select(files, limits: limits)
+        XCTAssertEqual(chosen.map(\.name), ["small.txt", "inside-link", "also-small.txt"])
+    }
+
+    func testFolderCapSkipsAFileThatDoesNotFitAndKeepsALaterSmallerOne() {
+        let mb = UInt64(1024 * 1024)
+        let limits = PrefetchPlanner.Limits(enabled: true, maxFileBytes: 10 * mb, maxFolderBytes: 5 * mb)
+        let files = [
+            PrefetchCandidate(name: "a", size: 3 * mb),
+            PrefetchCandidate(name: "b", size: 3 * mb),
+            PrefetchCandidate(name: "c", size: 2 * mb),
+        ]
+        XCTAssertEqual(PrefetchPlanner.select(files, limits: limits).map(\.name), ["a", "c"])
+    }
+
+    func testDisabledPrefetchSelectsNothing() {
+        var limits = limits
+        limits.enabled = false
+        XCTAssertTrue(PrefetchPlanner.select([PrefetchCandidate(name: "a", size: 10)], limits: limits).isEmpty)
+    }
+}
+
+final class ListingAndProfileTests: XCTestCase {
+    func testCompleteAttributesDoNotNeedAnotherStat() {
+        XCTAssertFalse(RemoteListing.needsExtraRequest(hasSize: true, hasModified: true, hasPermissions: true, isSymlink: false))
+        XCTAssertTrue(RemoteListing.needsExtraRequest(hasSize: true, hasModified: false, hasPermissions: true, isSymlink: false))
+        XCTAssertTrue(RemoteListing.needsExtraRequest(hasSize: true, hasModified: true, hasPermissions: true, isSymlink: true))
+    }
+
+    func testMetadataCacheExpiresAndDropsAPrefix() {
+        var cache = MetadataCache<String>(ttl: 30)
+        let now = Date()
+        cache.insert("notes", for: "/home/me/notes", at: now)
+        cache.insert("other", for: "/home/meadow", at: now)
+        XCTAssertEqual(cache.lookup("/home/me/notes", at: now.addingTimeInterval(10)), "notes")
+        XCTAssertNil(cache.lookup("/home/me/notes", at: now.addingTimeInterval(31)))
+        cache.insert("notes", for: "/home/me/notes", at: now)
+        cache.insert("child", for: "/home/me/notes/a", at: now)
+        cache.remove(prefix: "/home/me/notes")
+        XCTAssertNil(cache.lookup("/home/me/notes", at: now))
+        XCTAssertNil(cache.lookup("/home/me/notes/a", at: now))
+        XCTAssertEqual(cache.lookup("/home/meadow", at: now), "other")
+    }
+
+    func testSavedProfileWithoutKeepAllStillLoads() throws {
+        let id = UUID()
+        let json = """
+        {"authMethod":"password","host":"example.com","id":"\(id.uuidString)","maxConnections":3,"name":"Example","port":22,"refreshInterval":60,"remotePath":"","showHiddenFiles":true,"username":"ada"}
+        """.data(using: .utf8)!
+        let profile = try JSONDecoder().decode(ConnectionProfile.self, from: json)
+        XCTAssertFalse(profile.keepAllDownloaded)
+        XCTAssertEqual(profile.host, "example.com")
+        let data = try JSONEncoder().encode(profile)
+        let again = try JSONDecoder().decode(ConnectionProfile.self, from: data)
+        XCTAssertEqual(again, profile)
+    }
+}

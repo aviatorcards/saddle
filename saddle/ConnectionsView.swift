@@ -86,6 +86,7 @@ struct ConnectionsView: View {
         profile.maxConnections = model.settings.defaultParallelTransfers
         profile.refreshInterval = model.settings.defaultRefreshInterval
         profile.showHiddenFiles = model.settings.defaultShowHiddenFiles
+        profile.keepAllDownloaded = model.settings.defaultKeepAllDownloaded
         model.save(profile)
         selection = profile.id
     }

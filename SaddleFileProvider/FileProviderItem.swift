@@ -7,12 +7,15 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     let itemIdentifier: NSFileProviderItemIdentifier
     let parentItemIdentifier: NSFileProviderItemIdentifier
     let filename: String
+    /// True when the user, or the connection's "keep all files downloaded" setting, wants this item on disk.
+    let keptDownloaded: Bool
 
-    init(entry: RemoteEntry, identifier: NSFileProviderItemIdentifier, parent: NSFileProviderItemIdentifier, filename: String? = nil) {
+    init(entry: RemoteEntry, identifier: NSFileProviderItemIdentifier, parent: NSFileProviderItemIdentifier, filename: String? = nil, keptDownloaded: Bool = false) {
         self.entry = entry
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parent
         self.filename = filename ?? entry.name
+        self.keptDownloaded = keptDownloaded
     }
 
     var capabilities: NSFileProviderItemCapabilities {
@@ -63,9 +66,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return flags
     }
 
-    /// Downloaded copies are dropped when the remote file changes, so stale data is never
-    /// served and the local cache doesn't grow with superseded versions.
+    /// Pinned items stay on disk and are fetched before they are opened, which clears the
+    /// cloud badge. Everything else is downloaded on open and dropped when the remote changes.
     var contentPolicy: NSFileProviderContentPolicy {
-        entry.isDirectory ? .inherited : .downloadLazilyAndEvictOnRemoteUpdate
+        if keptDownloaded { return .downloadEagerlyAndKeepDownloaded }
+        return entry.isDirectory ? .inherited : .downloadLazilyAndEvictOnRemoteUpdate
     }
 }

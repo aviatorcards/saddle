@@ -4,7 +4,7 @@ import Citadel
 import os
 
 /// Replicated File Provider for one SFTP connection (one domain per saved profile).
-final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, NSFileProviderCustomAction {
     struct RemoteChanges {
         var updated: [FileProviderItem]
         var deleted: [NSFileProviderItemIdentifier]
@@ -22,6 +22,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private let state: DomainState?
     private let status: StatusReporter?
     private let claims = NameClaims()
+    private let pinLock = NSLock()
+    private var pinCache: (id: UUID, at: Date, pins: DownloadPins)?
+
+    static let keepDownloadedAction = "dev.fddl.saddle.keepDownloaded"
+    static let removeDownloadAction = "dev.fddl.saddle.removeDownload"
 
     static let log = Logger(subsystem: "dev.fddl.saddle.SaddleFileProvider", category: "extension")
 
@@ -137,13 +142,36 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     }
 
     private func makeItem(_ entry: RemoteEntry, relativePath: String, in context: Context) async -> FileProviderItem {
+        let kept = currentPins(profile: context.profile).keeps(relativePath, keepAll: context.profile.keepAllDownloaded)
         let identifier = await context.state.identifier(for: relativePath)
         if relativePath.isEmpty {
             return FileProviderItem(entry: entry, identifier: .rootContainer, parent: .rootContainer,
-                                    filename: context.profile.displayName)
+                                    filename: context.profile.displayName, keptDownloaded: kept)
         }
         let parent = await context.state.identifier(for: Self.parent(of: relativePath))
-        return FileProviderItem(entry: entry, identifier: identifier, parent: parent)
+        return FileProviderItem(entry: entry, identifier: identifier, parent: parent, keptDownloaded: kept)
+    }
+
+    private func recordedVersion(_ entry: RemoteEntry, path: String, profile: ConnectionProfile) -> String {
+        let kept = currentPins(profile: profile).keeps(path, keepAll: profile.keepAllDownloaded)
+        return "\(entry.metadataVersion)|\(kept ? "kept" : "lazy")"
+    }
+
+    private func currentPins(profile: ConnectionProfile) -> DownloadPins {
+        pinLock.lock()
+        defer { pinLock.unlock() }
+        if let pinCache, pinCache.id == profile.id, Date().timeIntervalSince(pinCache.at) < 2 {
+            return pinCache.pins
+        }
+        let pins = DownloadPins.load(from: DownloadPins.fileURL(profileID: profile.id))
+        pinCache = (profile.id, Date(), pins)
+        return pins
+    }
+
+    private func forgetCachedPins() {
+        pinLock.lock()
+        pinCache = nil
+        pinLock.unlock()
     }
 
     private func shows(_ name: String, profile: ConnectionProfile) -> Bool {
@@ -184,27 +212,82 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     // MARK: - Enumeration support
 
-    func listItems(in container: NSFileProviderItemIdentifier) async throws -> [FileProviderItem] {
+    struct ItemPage {
+        var items: [FileProviderItem]
+        var nextOffset: Int?
+    }
+
+    /// One page of visible items. The snapshot is written when enumeration finishes,
+    /// so a partial page is not treated as a deletion of the names Finder has not seen yet.
+    func listPage(in container: NSFileProviderItemIdentifier, offset: Int, limit: Int) async throws -> ItemPage {
         let context = try await context()
         guard container != .trashContainer else { throw NSFileProviderError(.noSuchItem) }
         let directory = try await relativePath(for: container, in: context)
-        let entries = try await context.session.list(try absolute(directory, in: context))
-
+        let page = try await context.session.listPage(try absolute(directory, in: context), offset: offset, limit: limit)
         var items: [FileProviderItem] = []
-        var snapshot: [String: String] = [:]
-        var links = Set<String>()
-        for entry in entries {
-            let relative = Self.joined(directory, entry.name)
-            if entry.isSymlink { links.insert(relative) }
+        for entry in page.entries {
             guard shows(entry.name, profile: context.profile) else { continue }
-            let item = await makeItem(entry, relativePath: relative, in: context)
-            snapshot[item.itemIdentifier.rawValue] = entry.metadataVersion
-            items.append(item)
+            items.append(await makeItem(entry, relativePath: Self.joined(directory, entry.name), in: context))
         }
-        await context.state.setSymlinks(links, in: directory)
-        await context.state.setSnapshot(snapshot, of: container)
-        await context.state.flush()
-        return items
+        return ItemPage(items: items, nextOffset: page.nextOffset)
+    }
+
+    /// Records the full directory and starts prefetching small files. Called after the last page.
+    func finishListing(in container: NSFileProviderItemIdentifier) async {
+        do {
+            let context = try await context()
+            let directory = try await relativePath(for: container, in: context)
+            let absolutePath = try absolute(directory, in: context)
+            let entries = try await context.session.list(absolutePath)
+            var snapshot: [String: String] = [:]
+            var links = Set<String>()
+            for entry in entries {
+                let relative = Self.joined(directory, entry.name)
+                if entry.isSymlink { links.insert(relative) }
+                guard shows(entry.name, profile: context.profile) else { continue }
+                let item = await makeItem(entry, relativePath: relative, in: context)
+                snapshot[item.itemIdentifier.rawValue] = recordedVersion(entry, path: relative, profile: context.profile)
+            }
+            await context.state.setSymlinks(links, in: directory)
+            await context.state.setSnapshot(snapshot, of: container)
+            await context.state.flush()
+            await prefetch(directory: directory, absolutePath: absolutePath, context: context)
+        } catch {
+            Self.log.error("finish listing \(container.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Asks the system to materialize the small files in a folder that was just opened.
+    /// Two at a time, so a copy or a listing can still get a channel.
+    private func prefetch(directory: String, absolutePath: String, context: Context) async {
+        let tuning = FinderTuning.load()
+        let selected = PrefetchPlanner.select(
+            await context.session.prefetchSources(at: absolutePath),
+            limits: PrefetchPlanner.Limits(
+                enabled: tuning.prefetchEnabled,
+                maxFileBytes: UInt64(clamping: max(0, tuning.maxFileBytes)),
+                maxFolderBytes: UInt64(clamping: max(0, tuning.maxFolderBytes))))
+        guard !selected.isEmpty, let manager = NSFileProviderManager(for: domain) else { return }
+        let pins = currentPins(profile: context.profile)
+        var identifiers: [NSFileProviderItemIdentifier] = []
+        for file in selected {
+            let relative = Self.joined(directory, file.name)
+            if pins.keeps(relative, keepAll: context.profile.keepAllDownloaded) { continue }
+            identifiers.append(await context.state.identifier(for: relative))
+        }
+        var index = 0
+        while index < identifiers.count {
+            if Task.isCancelled { return }
+            let end = min(index + 2, identifiers.count)
+            await withTaskGroup(of: Void.self) { group in
+                for identifier in identifiers[index..<end] {
+                    group.addTask {
+                        try? await manager.requestDownloadForItem(withIdentifier: identifier)
+                    }
+                }
+            }
+            index = end
+        }
     }
 
     /// Re-lists every directory that has been enumerated and reports what changed remotely.
@@ -226,6 +309,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             recordDelete(NSFileProviderItemIdentifier(raw))
         }
 
+        struct DirectoryJob {
+            var directoryID: NSFileProviderItemIdentifier
+            var directory: String
+            var remoteDirectory: String
+            var previous: [String: String]
+        }
+        var jobs: [DirectoryJob] = []
         for directoryID in await context.state.snapshotDirectories {
             try Task.checkCancellation()
             guard let directory = await context.state.relativePath(for: directoryID),
@@ -233,22 +323,24 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 await context.state.dropSnapshot(of: directoryID)
                 continue
             }
-
-            let remoteDirectory: String
             do {
-                remoteDirectory = try absolute(directory, in: context)
+                let remoteDirectory = try absolute(directory, in: context)
+                jobs.append(DirectoryJob(directoryID: directoryID, directory: directory, remoteDirectory: remoteDirectory, previous: previous))
             } catch {
                 await context.state.dropSnapshot(of: directoryID)
-                continue
             }
+        }
 
+        // Directories are listed together so the channel pool stays busy. Diffs are applied
+        // one directory at a time because they update the shared identifier map.
+        let listings = await context.session.listMany(jobs.map(\.remoteDirectory))
+        for (job, listing) in zip(jobs, listings) {
             let entries: [RemoteEntry]
-            do {
-                entries = try await context.session.list(remoteDirectory)
-            } catch {
+            switch listing {
+            case .failure(let error):
                 if SFTPSession.isMissing(error) {
-                    if directoryID != .rootContainer {
-                        let removed = await context.state.remove(directory)
+                    if job.directoryID != .rootContainer {
+                        let removed = await context.state.remove(job.directory)
                         await context.state.noteDeletions(removed)
                         reportedDeletionIDs.append(contentsOf: removed)
                         for raw in removed { recordDelete(NSFileProviderItemIdentifier(raw)) }
@@ -256,30 +348,30 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     continue
                 }
                 throw error
+            case .success(let value):
+                entries = value
             }
 
             var current: [String: String] = [:]
             var links = Set<String>()
             let visibleNames = Set(entries.map(\.name))
             for entry in entries {
-                let relative = Self.joined(directory, entry.name)
+                let relative = Self.joined(job.directory, entry.name)
                 if entry.isSymlink { links.insert(relative) }
                 guard shows(entry.name, profile: context.profile) else { continue }
                 let item = await makeItem(entry, relativePath: relative, in: context)
-                current[item.itemIdentifier.rawValue] = entry.metadataVersion
-                if previous[item.itemIdentifier.rawValue] != entry.metadataVersion {
+                let version = recordedVersion(entry, path: relative, profile: context.profile)
+                current[item.itemIdentifier.rawValue] = version
+                if job.previous[item.itemIdentifier.rawValue] != version {
                     updated.append(item)
                 }
             }
-            await context.state.setSymlinks(links, in: directory)
-            for (childID, _) in previous where current[childID] == nil {
+            await context.state.setSymlinks(links, in: job.directory)
+            for (childID, _) in job.previous where current[childID] == nil {
                 let identifier = NSFileProviderItemIdentifier(childID)
                 if let path = await context.state.relativePath(for: identifier) {
                     let name = RemotePath.name(of: path)
                     if visibleNames.contains(name), !shows(name, profile: context.profile) {
-                        // Still on the server, only hidden by the current filter. Tell Finder
-                        // to drop it, but keep the identifier so showing hidden files brings
-                        // the same item back.
                         recordDelete(identifier)
                         continue
                     }
@@ -291,7 +383,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     recordDelete(identifier)
                 }
             }
-            await context.state.setSnapshot(current, of: directoryID)
+            await context.state.setSnapshot(current, of: job.directoryID)
         }
 
         let changed = !updated.isEmpty || !deleted.isEmpty
@@ -433,7 +525,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
                 let entry = try await context.session.stat(remotePath)
                 let item = await makeItem(entry, relativePath: path, in: context)
-                await context.state.updateChild(item.itemIdentifier, version: entry.metadataVersion, in: item.parentItemIdentifier)
+                await context.state.updateChild(item.itemIdentifier, version: recordedVersion(entry, path: path, profile: context.profile), in: item.parentItemIdentifier)
                 await context.state.flush()
                 await releaseClaim(path)
                 return AppliedItem(item: item, fetchContent: false)
@@ -530,7 +622,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 ? try await metadata(for: path, in: context)
                 : try await context.session.stat(remotePath)
             let updated = await makeItem(entry, relativePath: path, in: context)
-            await context.state.updateChild(updated.itemIdentifier, version: entry.metadataVersion, in: updated.parentItemIdentifier)
+            await context.state.updateChild(updated.itemIdentifier, version: recordedVersion(entry, path: path, profile: context.profile), in: updated.parentItemIdentifier)
             await context.state.flush()
             await releaseClaim(claimed)
             return AppliedItem(item: updated, fetchContent: fetchContent)
@@ -610,6 +702,57 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             switch result {
             case .success: completionHandler(nil)
             case .failure(let error): completionHandler(error)
+            }
+        }
+    }
+
+    func performAction(identifier: NSFileProviderExtensionActionIdentifier,
+                       onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
+                       completionHandler: @escaping (Error?) -> Void) -> Progress {
+        run(Progress(), { [self] in
+            try await applyFinderAction(identifier, to: itemIdentifiers)
+        }) { result in
+            switch result {
+            case .success: completionHandler(nil)
+            case .failure(let error): completionHandler(error)
+            }
+        }
+    }
+
+    private func applyFinderAction(_ identifier: NSFileProviderExtensionActionIdentifier,
+                                   to itemIdentifiers: [NSFileProviderItemIdentifier]) async throws {
+        let name = identifier.rawValue
+        let removing = name == Self.removeDownloadAction
+        let keeping = name == Self.keepDownloadedAction
+        guard removing || keeping else {
+            throw NSFileProviderError(.cannotSynchronize, userInfo: [
+                NSLocalizedDescriptionKey: "Finder asked for an action Saddle doesn't provide.",
+            ])
+        }
+        let context = try await context()
+        var pins = DownloadPins.load(from: DownloadPins.fileURL(profileID: context.profile.id))
+        var parents = Set<NSFileProviderItemIdentifier>()
+        for identifier in itemIdentifiers {
+            let path = try await relativePath(for: identifier, in: context)
+            if removing {
+                pins.release(path)
+            } else {
+                pins.pin(path)
+            }
+            parents.insert(await context.state.identifier(for: Self.parent(of: path)))
+        }
+        try pins.save(to: DownloadPins.fileURL(profileID: context.profile.id))
+        forgetCachedPins()
+        guard let manager = NSFileProviderManager(for: domain) else { return }
+        try? await manager.signalEnumerator(for: .workingSet)
+        for parent in parents where parent != .workingSet {
+            try? await manager.signalEnumerator(for: parent)
+        }
+        if removing {
+            for identifier in itemIdentifiers {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    manager.evictItem(identifier: identifier) { _ in continuation.resume() }
+                }
             }
         }
     }

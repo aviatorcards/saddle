@@ -126,6 +126,30 @@ actor SFTPSession {
     /// Absolute remote path that maps to the root of the mounted location.
     private(set) var rootPath: String?
 
+    /// Listing attributes are reused for a short time so a stat that follows a listing
+    /// does not open another request for the same path.
+    private var metadata = MetadataCache<RemoteEntry>(ttl: 30)
+    /// Name lists Citadel already buffered, plus the entries resolved for pages Finder asked for.
+    private var directories: [String: OpenDirectory] = [:]
+    private let directoryTTL: TimeInterval = 120
+
+    private struct OpenDirectory {
+        var children: [RawChild]
+        var resolved: [Int: RemoteEntry] = [:]
+        var at: Date
+    }
+
+    private struct RawChild: Sendable {
+        var index: Int
+        var name: String
+        var path: String
+        var attributes: SFTPFileAttributes
+        var longname: String
+        var isSymlink: Bool
+        var needsRequest: Bool
+        var ready: RemoteEntry?
+    }
+
     private static let readChunk: UInt32 = 128 * 1024
     private static let writeChunk = 256 * 1024
 
@@ -167,6 +191,8 @@ actor SFTPSession {
     func close() async {
         keepAlive?.cancel()
         keepAlive = nil
+        metadata.removeAll()
+        directories.removeAll()
         rootPath = nil
         let open = channels
         channels.removeAll()
@@ -412,10 +438,126 @@ actor SFTPSession {
         return real
     }
 
+    struct ListedPage: Sendable {
+        var entries: [RemoteEntry]
+        /// Offset of the next page. Nil means Finder has the last page.
+        var nextOffset: Int?
+    }
+
+    /// One page of a directory. Offset 0 reads the name list again.
+    ///
+    /// Citadel 0.12's `listDirectory` buffers every `readdir` response, so the names for
+    /// this directory are complete before the first page is returned. Extra stats run
+    /// only for this page, and they share the channel pool.
+    func listPage(_ path: String, offset: Int, limit: Int) async throws -> ListedPage {
+        let limit = max(1, limit)
+        if offset == 0 || directories[path] == nil || isStale(directories[path]) {
+            try await refreshDirectory(path)
+        }
+        guard let directory = directories[path] else {
+            return ListedPage(entries: [], nextOffset: nil)
+        }
+        let bounds = DirectoryPage.bounds(itemCount: directory.children.count, offset: offset, pageSize: limit)
+        if bounds.start < bounds.end {
+            try await resolve(path: path, range: bounds.start..<bounds.end)
+        }
+        let entries = (bounds.start..<bounds.end).compactMap { directories[path]?.resolved[$0] }
+        return ListedPage(entries: entries, nextOffset: bounds.nextOffset)
+    }
+
+    /// Every child Finder is allowed to see. Reuses a listing that is already being paged.
     func list(_ path: String) async throws -> [RemoteEntry] {
+        if directories[path] == nil || isStale(directories[path]) {
+            try await refreshDirectory(path)
+        }
+        let count = directories[path]?.children.count ?? 0
+        if count > 0 {
+            try await resolve(path: path, range: 0..<count)
+        }
+        return (0..<count).compactMap { directories[path]?.resolved[$0] }
+    }
+
+    /// Lists several directories at once, up to the channel limit. One failure does not cancel the others.
+    func listMany(_ paths: [String]) async -> [Result<[RemoteEntry], Error>] {
+        var results = Array(repeating: Result<[RemoteEntry], Error>.success([]), count: paths.count)
+        let width = max(1, profile.maxConnections)
+        var nextIndex = 0
+        await withTaskGroup(of: (Int, Result<[RemoteEntry], Error>).self) { group in
+            func schedule() {
+                guard nextIndex < paths.count else { return }
+                let index = nextIndex
+                let path = paths[index]
+                nextIndex += 1
+                group.addTask {
+                    do {
+                        return (index, .success(try await self.list(path)))
+                    } catch {
+                        return (index, .failure(error))
+                    }
+                }
+            }
+            for _ in 0..<min(width, paths.count) { schedule() }
+            while let finished = await group.next() {
+                results[finished.0] = finished.1
+                schedule()
+            }
+        }
+        return results
+    }
+
+    /// Children of a directory that was just listed, for choosing what to prefetch.
+    /// A symlink that has not been resolved is treated as escaping the mount.
+    func prefetchSources(at path: String) -> [PrefetchCandidate] {
+        guard let directory = directories[path] else { return [] }
+        return directory.children.map { child in
+            if let entry = directory.resolved[child.index] {
+                return PrefetchCandidate(
+                    name: entry.name,
+                    size: entry.size,
+                    isDirectory: entry.isDirectory,
+                    isHidden: entry.name.hasPrefix("."),
+                    isPartial: RemotePath.isPartialUpload(entry.name),
+                    isSymlink: entry.isSymlink,
+                    symlinkEscapesMount: false)
+            }
+            if child.isSymlink {
+                return PrefetchCandidate(
+                    name: child.name,
+                    size: child.attributes.size ?? 0,
+                    isHidden: child.name.hasPrefix("."),
+                    isSymlink: true,
+                    symlinkEscapesMount: true)
+            }
+            let entry = child.ready
+            return PrefetchCandidate(
+                name: child.name,
+                size: entry?.size ?? child.attributes.size ?? 0,
+                isDirectory: entry?.isDirectory ?? (Self.kind(of: child.attributes, longname: child.longname) == .directory),
+                isHidden: child.name.hasPrefix("."),
+                isPartial: RemotePath.isPartialUpload(child.name))
+        }
+    }
+
+    private func isStale(_ directory: OpenDirectory?) -> Bool {
+        guard let directory else { return true }
+        return Date().timeIntervalSince(directory.at) > directoryTTL
+    }
+
+    private func refreshDirectory(_ path: String) async throws {
+        let children = try await rawListing(path)
+        var directory = OpenDirectory(children: children, at: Date())
+        for child in children {
+            if let ready = child.ready {
+                directory.resolved[child.index] = ready
+                remember(ready)
+            }
+        }
+        directories[path] = directory
+    }
+
+    /// Citadel buffers the whole name list. This does not stat each child.
+    private func rawListing(_ path: String) async throws -> [RawChild] {
         try await performRead { sftp in
-            // A directory link that used to point inside the mount may have been retargeted.
-            // Listing it anyway would show, and then allow deletes of, the new target.
             do {
                 _ = try await realPathInsideMount(path, using: sftp)
             } catch SaddleError.outsideMount {
@@ -423,28 +565,88 @@ actor SFTPSession {
             }
             let components = try await sftp.listDirectory(atPath: path).flatMap(\.components)
             let names = Set(components.map(\.filename))
-            var entries: [RemoteEntry] = []
+            var children: [RawChild] = []
             for component in components {
                 let name = component.filename
                 guard RemotePath.isSafeComponent(name) else { continue }
-                // In-flight uploads. Hidden from Finder so a half-written file is never opened.
                 if RemotePath.isPartialUpload(name) { continue }
-                // An overwrite's backup is only worth showing if the original went missing,
-                // because then it's the only copy of the previous version.
                 if let original = RemotePath.originalName(ofBackup: name), names.contains(original) { continue }
                 let childPath = RemotePath.join(path, name)
+                let symlink = Self.isSymlink(component.attributes, longname: component.longname)
+                let needsRequest = RemoteListing.needsExtraRequest(
+                    hasSize: component.attributes.size != nil,
+                    hasModified: component.attributes.accessModificationTime != nil,
+                    hasPermissions: component.attributes.permissions != nil,
+                    isSymlink: symlink)
+                let ready = needsRequest ? nil : Self.entry(path: childPath, attributes: component.attributes, longname: component.longname)
+                children.append(RawChild(
+                    index: children.count,
+                    name: name,
+                    path: childPath,
+                    attributes: component.attributes,
+                    longname: component.longname,
+                    isSymlink: symlink,
+                    needsRequest: needsRequest,
+                    ready: ready))
+            }
+            return children
+        }
+    }
 
-                if Self.isSymlink(component.attributes, longname: component.longname) {
-                    // Links that resolve inside the mount look like their targets. Links that
-                    // point outside it, or nowhere, are left out so Finder can't leave the mount.
-                    guard let link = try await followLink(childPath, using: sftp) else { continue }
-                    entries.append(link.entry)
-                } else {
-                    entries.append(Self.entry(path: childPath, attributes: component.attributes, longname: component.longname))
+    private func resolve(path: String, range: Range<Int>) async throws {
+        guard let directory = directories[path] else { return }
+        let pending = range.filter { directory.resolved[$0] == nil }
+        if pending.isEmpty { return }
+        let width = max(1, profile.maxConnections)
+        var cursor = 0
+        try await withThrowingTaskGroup(of: (Int, RemoteEntry?).self) { group in
+            func schedule() {
+                guard cursor < pending.count else { return }
+                let index = pending[cursor]
+                cursor += 1
+                let child = directory.children[index]
+                group.addTask {
+                    let entry = try await self.resolveChild(child)
+                    return (index, entry)
                 }
             }
-            return entries
+            for _ in 0..<min(width, pending.count) { schedule() }
+            while let finished = try await group.next() {
+                if let entry = finished.1 {
+                    directories[path]?.resolved[finished.0] = entry
+                    remember(entry)
+                }
+                schedule()
+            }
         }
+    }
+
+    private func resolveChild(_ child: RawChild) async throws -> RemoteEntry? {
+        if let ready = child.ready { return ready }
+        if child.isSymlink {
+            return try await performRead { sftp in
+                try await followLink(child.path, using: sftp)?.entry
+            }
+        }
+        return try await performRead { sftp in
+            do {
+                _ = try await realPathInsideMount(child.path, using: sftp)
+            } catch SaddleError.outsideMount {
+                return nil
+            }
+            return Self.entry(path: child.path, attributes: try await sftp.getAttributes(at: child.path), longname: child.longname)
+        }
+    }
+
+    private func remember(_ entry: RemoteEntry) {
+        metadata.insert(entry, for: entry.path, at: Date())
+    }
+
+    private func forget(path: String) {
+        metadata.remove(prefix: path)
+        directories[path] = nil
+        let parent = RemotePath.parent(of: path)
+        if parent != path { directories[parent] = nil }
     }
 
     /// Metadata for a symbolic link's target, and the target's canonical path.
@@ -469,10 +671,13 @@ actor SFTPSession {
     }
 
     func stat(_ path: String) async throws -> RemoteEntry {
-        try await performRead { sftp in
+        if let cached = metadata.lookup(path, at: Date()) { return cached }
+        let entry = try await performRead { sftp in
             _ = try await realPathInsideMount(path, using: sftp)
             return Self.entry(path: path, attributes: try await sftp.getAttributes(at: path), longname: "")
         }
+        remember(entry)
+        return entry
     }
 
     func exists(_ path: String) async throws -> Bool {
@@ -580,12 +785,14 @@ actor SFTPSession {
                 try? await sftp.remove(at: backup)
             }
         }
+        forget(path: path)
     }
 
     // MARK: - Mutations
 
     func createDirectory(_ path: String) async throws {
         try await withChannel { try await $0.createDirectory(atPath: path) }
+        forget(path: path)
     }
 
     func rename(_ path: String, to newPath: String) async throws {
@@ -600,10 +807,14 @@ actor SFTPSession {
             if !sourceExists && destinationExists { return }
             if sourceExists && !destinationExists {
                 try await withChannel { try await $0.rename(at: path, to: newPath) }
+                forget(path: path)
+                forget(path: newPath)
                 return
             }
             throw error
         }
+        forget(path: path)
+        forget(path: newPath)
     }
 
     func setModificationDate(_ date: Date, for path: String) async throws {
@@ -612,6 +823,7 @@ actor SFTPSession {
             attributes.accessModificationTime = .init(accessTime: date, modificationTime: date)
             try await sftp.setAttributes(at: path, to: attributes)
         }
+        forget(path: path)
     }
 
     func setPermissions(_ permissions: UInt32, for path: String) async throws {
@@ -620,6 +832,7 @@ actor SFTPSession {
             attributes.permissions = permissions & 0o7777
             try await sftp.setAttributes(at: path, to: attributes)
         }
+        forget(path: path)
     }
 
     /// Missing files count as success so a lost reply doesn't abort a recursive delete.
@@ -627,9 +840,13 @@ actor SFTPSession {
         do {
             try await withChannel { try await $0.remove(at: path) }
         } catch {
-            if Self.isMissing(error) { return }
+            if Self.isMissing(error) {
+                forget(path: path)
+                return
+            }
             throw error
         }
+        forget(path: path)
     }
 
     /// Removes a directory. With `recursive`, deletes its contents first (depth-first).
@@ -652,6 +869,7 @@ actor SFTPSession {
             if Self.isMissing(error) { return }
             throw error
         }
+        forget(path: path)
     }
 
     /// Children without following symlinks, so recursive deletes never escape the tree.

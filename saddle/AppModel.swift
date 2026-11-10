@@ -75,7 +75,10 @@ final class AppModel {
 
         // Re-adding an existing domain updates its Finder sidebar name.
         if mountedIDs.contains(profile.id) {
-            Task { try? await NSFileProviderManager.add(domain(for: profile)) }
+            Task {
+                try? await NSFileProviderManager.add(domain(for: profile))
+                try? await NSFileProviderManager(for: domain(for: profile))?.signalEnumerator(for: .workingSet)
+            }
         }
     }
 
