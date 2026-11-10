@@ -6,7 +6,7 @@ struct ConnectionsView: View {
     static let windowID = "connections"
 
     @Environment(AppModel.self) private var model
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @State private var selection: UUID?
     @State private var isImportingConfig = false
 
@@ -91,9 +91,7 @@ struct ConnectionsView: View {
     }
 
     private func showSettings() {
-        NSApp.setActivationPolicy(.regular)
-        openSettings()
-        WindowActivation.bringSettingsToFront()
+        WindowActivation.openSettings(using: openWindow)
     }
 
     private func deleteSelected() {
