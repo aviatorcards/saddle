@@ -94,6 +94,7 @@
         "INFOPLIST_KEY_CFBundleDisplayName": "Saddle",
         "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.utilities",
         "INFOPLIST_KEY_LSUIElement": "YES",
+        "INFOPLIST_KEY_NSLocalNetworkUsageDescription": "Saddle connects to SFTP servers you add, including servers on your local network, so it can show their files in Finder.",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]": "YES",
         "INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]": "YES",
         "INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]": "YES",

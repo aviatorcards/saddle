@@ -1,4 +1,5 @@
 import FileProvider
+import os
 
 /// Lists remote directories, and for the working set, reports remote changes.
 ///
@@ -49,6 +50,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 }
                 observer.finishEnumerating(upTo: nil)
             } catch {
+                FileProviderExtension.log.error("enumerate \(container.rawValue, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                 observer.finishEnumeratingWithError(FileProviderExtension.fileProviderError(error))
             }
         })
@@ -69,6 +71,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 observer.finishEnumeratingChanges(upTo: changes.anchor, moreComing: false)
                 await provider.acknowledgeDeletions(changes.reportedDeletionIDs)
             } catch {
+                FileProviderExtension.log.error("working set poll failed: \(String(describing: error), privacy: .public)")
                 observer.finishEnumeratingWithError(FileProviderExtension.fileProviderError(error))
             }
         })

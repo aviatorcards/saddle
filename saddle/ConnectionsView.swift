@@ -54,6 +54,12 @@ struct ConnectionsView: View {
         .fileDialogMessage("Choose your SSH config file. Press ⇧⌘. to show hidden folders such as ~/.ssh.")
         .onAppear {
             if selection == nil { selection = model.profiles.first?.id }
+            // Saddle lives in the menu bar (LSUIElement). While this window is open, act like
+            // a regular app so it appears in the Dock and Command-Tab.
+            NSApp.setActivationPolicy(.regular)
+        }
+        .onDisappear {
+            NSApp.setActivationPolicy(.accessory)
         }
     }
 

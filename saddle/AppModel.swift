@@ -160,7 +160,22 @@ final class AppModel {
         guard let manager = NSFileProviderManager(for: domain(for: profile)) else { return }
         do {
             let url = try await manager.getUserVisibleURL(for: .rootContainer)
-            NSWorkspace.shared.open(url)
+            // The sandbox only lets Saddle hand this folder to Finder while it holds the
+            // URL's security scope; without it, Finder reports a permission error.
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            guard let finder = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.finder") else {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+                return
+            }
+            do {
+                // Open with Finder explicitly, rather than "whatever opens folders".
+                try await NSWorkspace.shared.open([url], withApplicationAt: finder, configuration: configuration)
+            } catch {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
         } catch {
             fail(profile, error)
         }

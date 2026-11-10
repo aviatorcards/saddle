@@ -1,6 +1,7 @@
 import FileProvider
 import UniformTypeIdentifiers
 import Citadel
+import os
 
 /// Replicated File Provider for one SFTP connection (one domain per saved profile).
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
@@ -22,9 +23,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private let status: StatusReporter?
     private let claims = NameClaims()
 
+    static let log = Logger(subsystem: "dev.fddl.saddle.SaddleFileProvider", category: "extension")
+
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
         let profile = ProfileStore.profile(for: domain.identifier)
+        Self.log.notice("init domain \(domain.identifier.rawValue, privacy: .public): container \(AppGroup.containerURL.path, privacy: .public), profile found: \(profile != nil, privacy: .public), keychain shared: \(SecretStore.sharesWithExtension, privacy: .public)")
         self.profile = profile
         session = profile.map(SFTPSession.init(profile:))
         state = profile.map { DomainState(profileID: $0.id) }
@@ -90,6 +94,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             await status.set(.connected)
             return Context(session: session, state: state, status: status, profile: profile, root: root)
         } catch {
+            Self.log.error("connect failed: \(error.localizedDescription, privacy: .public)")
             await status.set(.error, message: error.localizedDescription)
             throw error
         }
@@ -611,6 +616,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
         guard profile != nil else { throw NSFileProviderError(.notAuthenticated) }
+        // SFTP has no trash. The system asks anyway, and logs this rejection as FP -1005.
         guard containerItemIdentifier != .trashContainer else { throw NSFileProviderError(.noSuchItem) }
         return FileProviderEnumerator(container: containerItemIdentifier, provider: self)
     }
