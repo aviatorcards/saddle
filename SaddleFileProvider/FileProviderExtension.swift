@@ -760,6 +760,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             switch saddleError {
             case .connectionFailed: return NSFileProviderError(.serverUnreachable, userInfo: info)
             case .notADirectory: return NSFileProviderError(.noSuchItem, userInfo: info)
+            case .outsideMount: return NSFileProviderError(.cannotSynchronize, userInfo: info)
             case .missingCredentials, .authenticationFailed, .profileNotFound:
                 return NSFileProviderError(.notAuthenticated, userInfo: info)
             case .unknownHostKey, .hostKeyChanged, .unsupportedKey:

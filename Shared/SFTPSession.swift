@@ -310,9 +310,11 @@ actor SFTPSession {
             if touchActivity { lastActivity = Date() }
 
             if channels.count + openingChannels < limit {
-                let ssh = try await sshClient()
+                // Count this open before the first await. Otherwise two callers both
+                // pass the check and both open a channel.
                 openingChannels += 1
                 defer { openingChannels -= 1 }
+                let ssh = try await sshClient()
                 let opened = try await ssh.openSFTP()
                 channels.append(opened)
                 return opened
@@ -401,8 +403,24 @@ actor SFTPSession {
 
     // MARK: - Metadata
 
+    /// `getRealPath` follows links. Refuse a path whose canonical location is outside the mount.
+    /// Returns nil when the mount root is not known yet (during connect).
+    private func realPathInsideMount(_ path: String, using sftp: SFTPClient) async throws -> String? {
+        guard let rootPath else { return nil }
+        let real = try await sftp.getRealPath(atPath: path)
+        guard RemotePath.isInside(real, root: rootPath) else { throw SaddleError.outsideMount }
+        return real
+    }
+
     func list(_ path: String) async throws -> [RemoteEntry] {
         try await performRead { sftp in
+            // A directory link that used to point inside the mount may have been retargeted.
+            // Listing it anyway would show, and then allow deletes of, the new target.
+            do {
+                _ = try await realPathInsideMount(path, using: sftp)
+            } catch SaddleError.outsideMount {
+                return []
+            }
             let components = try await sftp.listDirectory(atPath: path).flatMap(\.components)
             let names = Set(components.map(\.filename))
             var entries: [RemoteEntry] = []
@@ -452,7 +470,8 @@ actor SFTPSession {
 
     func stat(_ path: String) async throws -> RemoteEntry {
         try await performRead { sftp in
-            Self.entry(path: path, attributes: try await sftp.getAttributes(at: path), longname: "")
+            _ = try await realPathInsideMount(path, using: sftp)
+            return Self.entry(path: path, attributes: try await sftp.getAttributes(at: path), longname: "")
         }
     }
 
@@ -471,6 +490,7 @@ actor SFTPSession {
     /// Streams a remote file to `localURL` in chunks, reporting cumulative bytes.
     func download(_ path: String, to localURL: URL, progress: @Sendable (Int64) -> Void) async throws {
         try await performRead { sftp in
+            _ = try await realPathInsideMount(path, using: sftp)
             FileManager.default.createFile(atPath: localURL.path, contents: nil)
             let output = try FileHandle(forWritingTo: localURL)
             defer { try? output.close() }
@@ -507,6 +527,17 @@ actor SFTPSession {
         let backup = RemotePath.join(parent, RemotePath.backupName(for: RemotePath.name(of: path)))
 
         try await withChannel { sftp in
+            // A missing destination is fine; its parent still has to resolve inside the mount.
+            // An existing path that is a link to somewhere else must not be overwritten.
+            do {
+                _ = try await realPathInsideMount(path, using: sftp)
+            } catch {
+                guard Self.isMissing(error) else { throw error }
+                let parent = RemotePath.parent(of: path)
+                if parent != path {
+                    _ = try await realPathInsideMount(parent, using: sftp)
+                }
+            }
             let file = try await sftp.openFile(filePath: temporary, flags: [.write, .create, .truncate])
             do {
                 if let localURL {
@@ -603,6 +634,9 @@ actor SFTPSession {
 
     /// Removes a directory. With `recursive`, deletes its contents first (depth-first).
     func removeDirectory(_ path: String, recursive: Bool) async throws {
+        // Unlinking a symlink is removeFile, which does not follow the link. Removing a
+        // directory must not follow one: rawChildren would then delete the link's target.
+        _ = try await withChannel { try await realPathInsideMount(path, using: $0) }
         if recursive {
             for child in try await rawChildren(of: path) {
                 if child.isDirectory {
