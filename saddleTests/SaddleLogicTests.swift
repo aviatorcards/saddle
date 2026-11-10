@@ -159,6 +159,7 @@ final class SFTPSessionTests: XCTestCase {
         XCTAssertFalse(SFTPSession.isConnectionError(CancellationError()))
         XCTAssertFalse(SFTPSession.isConnectionError(CocoaError(.fileWriteOutOfSpace)))
         XCTAssertFalse(SFTPSession.isConnectionError(SaddleError.authenticationFailed))
+        XCTAssertFalse(SFTPSession.isConnectionError(SaddleError.outsideMount))
         XCTAssertTrue(SFTPSession.isConnectionError(POSIXError(.ECONNRESET)))
         XCTAssertFalse(SFTPSession.isConnectionError(POSIXError(.ENOENT)))
     }

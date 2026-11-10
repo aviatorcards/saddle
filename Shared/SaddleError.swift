@@ -9,6 +9,8 @@ nonisolated enum SaddleError: LocalizedError, Sendable {
     case authenticationFailed
     case connectionFailed(String)
     case notADirectory(String)
+    /// A path realpath'd to somewhere other than the mounted folder.
+    case outsideMount
 
     var errorDescription: String? {
         switch self {
@@ -28,6 +30,8 @@ nonisolated enum SaddleError: LocalizedError, Sendable {
             "Could not connect: \(detail)"
         case .notADirectory(let path):
             "\(path) is not a directory."
+        case .outsideMount:
+            "That item is outside the mounted folder."
         }
     }
 }
