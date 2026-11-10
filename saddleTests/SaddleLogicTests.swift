@@ -152,6 +152,70 @@ final class KnownHostsTests: XCTestCase {
         XCTAssertEqual(KnownHosts.key(host: "Example.COM", port: 22), "example.com")
         XCTAssertEqual(KnownHosts.key(host: "Example.COM", port: 2222), "[example.com]:2222")
     }
+
+    func testParseKey() {
+        let (host1, port1) = KnownHosts.parseKey("example.com")
+        XCTAssertEqual(host1, "example.com")
+        XCTAssertEqual(port1, 22)
+
+        let (host2, port2) = KnownHosts.parseKey("[example.com]:2222")
+        XCTAssertEqual(host2, "example.com")
+        XCTAssertEqual(port2, 2222)
+
+        let (host3, port3) = KnownHosts.parseKey("[2001:db8::1]:2222")
+        XCTAssertEqual(host3, "2001:db8::1")
+        XCTAssertEqual(port3, 2222)
+    }
+}
+
+final class AppSettingsTests: XCTestCase {
+    func testDefaultValues() {
+        let suiteName = "test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(userDefaults: defaults)
+        XCTAssertTrue(settings.openInFinderOnMount)
+        XCTAssertTrue(settings.notifyOnConnectionError)
+        XCTAssertFalse(settings.notifyOnMount)
+        XCTAssertFalse(settings.notifyOnDisconnect)
+        XCTAssertEqual(settings.defaultParallelTransfers, 3)
+        XCTAssertEqual(settings.defaultRefreshInterval, 60.0)
+        XCTAssertTrue(settings.defaultShowHiddenFiles)
+        XCTAssertEqual(settings.defaultPort, 22)
+    }
+
+    func testMutatingSettingsPersists() {
+        let suiteName = "test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(userDefaults: defaults)
+        settings.openInFinderOnMount = false
+        settings.defaultParallelTransfers = 6
+        settings.defaultRefreshInterval = 300
+        settings.defaultShowHiddenFiles = false
+        settings.defaultPort = 2222
+
+        let reloaded = AppSettings(userDefaults: defaults)
+        XCTAssertFalse(reloaded.openInFinderOnMount)
+        XCTAssertEqual(reloaded.defaultParallelTransfers, 6)
+        XCTAssertEqual(reloaded.defaultRefreshInterval, 300)
+        XCTAssertFalse(reloaded.defaultShowHiddenFiles)
+        XCTAssertEqual(reloaded.defaultPort, 2222)
+    }
+
+    func testResetToDefaults() {
+        let suiteName = "test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(userDefaults: defaults)
+        settings.defaultParallelTransfers = 8
+        settings.resetToDefaults()
+
+        XCTAssertEqual(settings.defaultParallelTransfers, 3)
+    }
 }
 
 final class SFTPSessionTests: XCTestCase {

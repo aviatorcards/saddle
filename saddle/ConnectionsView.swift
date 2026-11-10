@@ -6,6 +6,7 @@ struct ConnectionsView: View {
     static let windowID = "connections"
 
     @Environment(AppModel.self) private var model
+    @Environment(\.openSettings) private var openSettings
     @State private var selection: UUID?
     @State private var isImportingConfig = false
 
@@ -20,6 +21,13 @@ struct ConnectionsView: View {
                             .foregroundStyle(.secondary)
                     }
                     .tag(profile.id)
+                    .contextMenu {
+                        Button("Settings…", action: showSettings)
+                        Divider()
+                        Button("Delete", role: .destructive) {
+                            Task { await model.delete(profile) }
+                        }
+                    }
                 }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 230)
@@ -28,6 +36,9 @@ struct ConnectionsView: View {
                     Button("Add Connection", systemImage: "plus", action: addProfile)
                     Menu("More", systemImage: "ellipsis.circle") {
                         Button("Import from SSH Config…") { isImportingConfig = true }
+                        Divider()
+                        Button("Settings…", action: showSettings)
+                            .keyboardShortcut(",", modifiers: .command)
                         Divider()
                         Button("Delete Connection", role: .destructive, action: deleteSelected)
                             .disabled(selection == nil)
@@ -59,15 +70,30 @@ struct ConnectionsView: View {
             NSApp.setActivationPolicy(.regular)
         }
         .onDisappear {
-            NSApp.setActivationPolicy(.accessory)
+            let otherOpenWindows = NSApp.windows.filter { $0.isVisible && $0.canBecomeKey }
+            if otherOpenWindows.count <= 1 {
+                NSApp.setActivationPolicy(.accessory)
+            }
         }
     }
 
     private func addProfile() {
         var profile = ConnectionProfile()
         profile.name = "New Server"
+        profile.port = model.settings.defaultPort
+        profile.username = model.settings.defaultUsername.isEmpty ? NSUserName() : model.settings.defaultUsername
+        profile.remotePath = model.settings.defaultRemotePath
+        profile.maxConnections = model.settings.defaultParallelTransfers
+        profile.refreshInterval = model.settings.defaultRefreshInterval
+        profile.showHiddenFiles = model.settings.defaultShowHiddenFiles
         model.save(profile)
         selection = profile.id
+    }
+
+    private func showSettings() {
+        NSApp.setActivationPolicy(.regular)
+        openSettings()
+        WindowActivation.bringSettingsToFront()
     }
 
     private func deleteSelected() {

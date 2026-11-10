@@ -16,6 +16,7 @@ enum ConnectionState: Equatable {
 /// Owns saved connections and drives File Provider domains (one per mounted connection).
 @Observable
 final class AppModel {
+    var settings = AppSettings()
     private(set) var profiles: [ConnectionProfile] = ProfileStore.load()
     private(set) var mountedIDs: Set<UUID> = []
     private(set) var statuses: [UUID: DomainStatus] = [:]
@@ -115,7 +116,12 @@ final class AppModel {
             try await NSFileProviderManager.add(domain(for: profile))
             mountedIDs.insert(profile.id)
             ActivityLog.append("Mounted \(profile.displayName)", profileID: profile.id)
-            await openInFinder(profile)
+            if settings.notifyOnMount {
+                notify(title: "\(profile.displayName) mounted", body: "Connected to \(profile.host)")
+            }
+            if settings.openInFinderOnMount {
+                await openInFinder(profile)
+            }
         } catch {
             fail(profile, error)
         }
@@ -133,6 +139,9 @@ final class AppModel {
             statuses[profile.id] = nil
             localErrors[profile.id] = nil
             ActivityLog.append("Ejected \(profile.displayName)", profileID: profile.id)
+            if settings.notifyOnDisconnect {
+                notify(title: "\(profile.displayName) disconnected", body: "Unmounted volume")
+            }
         } catch {
             fail(profile, error)
         }
@@ -206,7 +215,14 @@ final class AppModel {
         guard !(error is CancellationError) else { return }
         localErrors[profile.id] = error.localizedDescription
         ActivityLog.append(error.localizedDescription, profileID: profile.id, isError: true)
-        notify(title: "\(profile.displayName) failed", body: error.localizedDescription)
+        if settings.notifyOnConnectionError {
+            notify(title: "\(profile.displayName) failed", body: error.localizedDescription)
+        }
+    }
+
+    func clearActivity() {
+        ActivityLog.clear()
+        activity = []
     }
 
     // MARK: - Background polling

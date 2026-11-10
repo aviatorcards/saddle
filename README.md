@@ -1,6 +1,6 @@
 # Saddle
 
-Saddle is a macOS menu bar app that mounts an SFTP server as a Finder volume, in the spirit of Mountain Duck. Each saved connection is a File Provider domain. The menu bar app (`saddle/`) edits profiles and asks you to trust host keys. The File Provider extension (`SaddleFileProvider/`) enumerates, reads, and writes the remote files. Shared code (`Shared/`) is the SSH session, keychain, and known-hosts store.
+Saddle is a macOS menu bar app that mounts SFTP servers as Finder volumes, in the spirit of Mountain Duck. Each saved connection runs as an independent File Provider domain. The menu bar app (`saddle/`) edits profiles, configures preferences, and manages host key verification. The File Provider extension (`SaddleFileProvider/`) enumerates, reads, and writes remote files. Shared code (`Shared/`) manages the SSH session, keychain access, and known-hosts store.
 
 ## Requirements
 
@@ -21,6 +21,25 @@ xcodebuild test -project saddle.xcodeproj -scheme saddle -destination 'platform=
 3. Finder talks to the extension. Item identifiers are stable UUIDs mapped to remote paths. Remote changes are detected by re-listing directories Finder has already opened.
 
 Deletes are permanent. SFTP has no trash.
+
+## Settings & Preferences
+
+Saddle includes a dedicated macOS Settings window (accessible via `⌘,`, from the menu bar popover header or footer, or within the Connections manager):
+
+- **General**:
+  - **Launch at Login**: Enable or disable automatic background launch at user login via `SMAppService`.
+  - **Finder Integration**: Automatically open and reveal the mounted directory in Finder upon connection.
+  - **Notifications**: Granular toggles for connection failure alerts, successful mount notices, and disconnection alerts.
+- **Connection Defaults**:
+  - Configure initial values for newly created connections (default port, default username, remote directory, default parallel SFTP channels 1–8, remote refresh check interval, and hidden file visibility).
+- **Known Hosts**:
+  - Inspect all trusted SSH server host keys stored in Saddle's `known_hosts.json`.
+  - Search and filter by hostname, port, or SHA-256 fingerprint.
+  - Copy fingerprints to clipboard or forget individual/all host keys to prompt verification on subsequent connections.
+- **Advanced**:
+  - Inspect the App Group shared container directory with one-click "Reveal in Finder".
+  - View logged event counts and clear the activity log.
+  - App version and architecture overview.
 
 ## Limits worth knowing
 

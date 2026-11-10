@@ -70,6 +70,12 @@ nonisolated enum ActivityLog {
         }
     }
 
+    static func clear() {
+        try? FileLock.withLock(url: url) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     /// Most recent entries first. Also trims the file when it grows too large.
     static func recent(limit: Int = 50) -> [Entry] {
         let data = (try? FileLock.withLock(url: url) { () -> Data? in
