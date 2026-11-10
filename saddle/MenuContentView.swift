@@ -4,7 +4,6 @@ import SwiftUI
 struct MenuContentView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -64,6 +63,7 @@ struct MenuContentView: View {
                 Button("Manage Connections…", action: showConnections)
                 Spacer()
                 Button("Settings…", action: showSettings)
+                    .keyboardShortcut(",", modifiers: .command)
                 Button("Quit Saddle") { NSApp.terminate(nil) }
             }
             .buttonStyle(.borderless)
@@ -78,9 +78,7 @@ struct MenuContentView: View {
     }
 
     private func showSettings() {
-        NSApp.setActivationPolicy(.regular)
-        openSettings()
-        WindowActivation.bringSettingsToFront()
+        WindowActivation.openSettings(using: openWindow)
     }
 }
 
